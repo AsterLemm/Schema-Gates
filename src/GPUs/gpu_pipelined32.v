@@ -7,10 +7,68 @@
 //  ppln_line / ppln_rect -- drive high for normal run), the same
 //  convention as the flagship RV32IM_SYSTEM.v execution units.
 //  screen_ready back-pressure stalls the WHOLE pipe (single pipe_en).
+//  MODULAR: 8 gated coverage leaf units + a painter colour mux.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
+
+// --- gpu_pipelined32_cov : one slot's coverage test, class-gated by ppln_* ---
+// pipeline synchronizer gating: external strobe AND slot class. With a
+// strobe low that class's comparators see all-zero inputs and emit no
+// coverage; drive all three strobes high for normal operation.
+module gpu_pipelined32_cov(
+    input  wire [4:0] sx,
+    input  wire [4:0] sy,
+    input  wire       en,
+    input  wire [1:0] ty,
+    input  wire [4:0] x0,
+    input  wire [4:0] y0,
+    input  wire [4:0] x1,
+    input  wire [4:0] y1,
+    input  wire       ppln_point,
+    input  wire       ppln_line,
+    input  wire       ppln_rect,
+    output wire       cov
+);
+    wire is_pt = (ty == 2'd0);
+    wire is_ln = (ty == 2'd1) | (ty == 2'd2);
+    wire is_rc = (ty == 2'd3);
+    wire gate  = en & ( (is_pt & ppln_point)
+                      | (is_ln & ppln_line)
+                      | (is_rc & ppln_rect) );
+    // operand isolation: comparator inputs forced to zero when gated off
+    wire [4:0] gx = sx & {5{gate}};
+    wire [4:0] gy = sy & {5{gate}};
+    wire xe = (gx == x0);
+    wire ye = (gy == y0);
+    wire xr = (gx >= x0) & (gx <= x1);
+    wire yr = (gy >= y0) & (gy <= y1);
+    assign cov = gate & (
+          (ty == 2'd0) ? (xe & ye)
+        : (ty == 2'd1) ? (ye & xr)
+        : (ty == 2'd2) ? (xe & yr)
+        :                (xr & yr));
+endmodule
+
+// --- gpu_pipelined32_colmux : painter priority colour mux (STAGE 3 datapath) ---
+module gpu_pipelined32_colmux(
+    input  wire [7:0]  cov,
+    input  wire [23:0] col0, input wire [23:0] col1,
+    input  wire [23:0] col2, input wire [23:0] col3,
+    input  wire [23:0] col4, input wire [23:0] col5,
+    input  wire [23:0] col6, input wire [23:0] col7,
+    input  wire        ctl_fill,
+    input  wire [23:0] fill_col,
+    output wire [23:0] comp_rgb
+);
+    wire [23:0] comp_col =
+          cov[7] ? col7 : cov[6] ? col6
+        : cov[5] ? col5 : cov[4] ? col4
+        : cov[3] ? col3 : cov[2] ? col2
+        : cov[1] ? col1 : cov[0] ? col0 : 24'd0;
+    assign comp_rgb = ctl_fill ? fill_col : comp_col;
+endmodule
 
 //  gpu_pipelined32: 8 slots x {point | hline | vline | rect} on 32x32, RGB24,
 //  rendered by a 3-stage pixel pipeline:
@@ -107,6 +165,7 @@ module gpu_pipelined32 (
 
     // =========================================================================
     //  STAGE 2 -- EVAL: 8 coverage tests, class datapaths gated by ppln_*
+    //  (one gpu_pipelined32_cov leaf per slot, see modules above)
     // =========================================================================
     reg        st2_v;
     reg [4:0]  st2_x, st2_y;
@@ -114,38 +173,67 @@ module gpu_pipelined32 (
     reg        st2_first, st2_last;
 
     wire [7:0] cov_w;
-    genvar g;
-    generate for (g = 0; g < 8; g = g + 1) begin : COV
-        // pipeline synchronizer gating: external strobe AND slot class
-        wire is_pt = (a_ty[g] == 2'd0);
-        wire is_ln = (a_ty[g] == 2'd1) | (a_ty[g] == 2'd2);
-        wire is_rc = (a_ty[g] == 2'd3);
-        wire gate  = a_en[g] & ( (is_pt & ppln_point)
-                               | (is_ln & ppln_line)
-                               | (is_rc & ppln_rect) );
-        // operand isolation: comparator inputs forced to zero when gated off
-        wire [4:0] gx = st1_x & {5{gate}};
-        wire [4:0] gy = st1_y & {5{gate}};
-        wire xe = (gx == a_x0[g]);
-        wire ye = (gy == a_y0[g]);
-        wire xr = (gx >= a_x0[g]) & (gx <= a_x1[g]);
-        wire yr = (gy >= a_y0[g]) & (gy <= a_y1[g]);
-        assign cov_w[g] = gate & (
-              (a_ty[g] == 2'd0) ? (xe & ye)
-            : (a_ty[g] == 2'd1) ? (ye & xr)
-            : (a_ty[g] == 2'd2) ? (xe & yr)
-            :                     (xr & yr));
-    end endgenerate
+    gpu_pipelined32_cov u_cov0(.sx(st1_x), .sy(st1_y),
+                       .en(a_en[0]), .ty(a_ty[0]),
+                       .x0(a_x0[0]), .y0(a_y0[0]),
+                       .x1(a_x1[0]), .y1(a_y1[0]),
+                       .ppln_point(ppln_point), .ppln_line(ppln_line),
+                       .ppln_rect(ppln_rect), .cov(cov_w[0]));
+    gpu_pipelined32_cov u_cov1(.sx(st1_x), .sy(st1_y),
+                       .en(a_en[1]), .ty(a_ty[1]),
+                       .x0(a_x0[1]), .y0(a_y0[1]),
+                       .x1(a_x1[1]), .y1(a_y1[1]),
+                       .ppln_point(ppln_point), .ppln_line(ppln_line),
+                       .ppln_rect(ppln_rect), .cov(cov_w[1]));
+    gpu_pipelined32_cov u_cov2(.sx(st1_x), .sy(st1_y),
+                       .en(a_en[2]), .ty(a_ty[2]),
+                       .x0(a_x0[2]), .y0(a_y0[2]),
+                       .x1(a_x1[2]), .y1(a_y1[2]),
+                       .ppln_point(ppln_point), .ppln_line(ppln_line),
+                       .ppln_rect(ppln_rect), .cov(cov_w[2]));
+    gpu_pipelined32_cov u_cov3(.sx(st1_x), .sy(st1_y),
+                       .en(a_en[3]), .ty(a_ty[3]),
+                       .x0(a_x0[3]), .y0(a_y0[3]),
+                       .x1(a_x1[3]), .y1(a_y1[3]),
+                       .ppln_point(ppln_point), .ppln_line(ppln_line),
+                       .ppln_rect(ppln_rect), .cov(cov_w[3]));
+    gpu_pipelined32_cov u_cov4(.sx(st1_x), .sy(st1_y),
+                       .en(a_en[4]), .ty(a_ty[4]),
+                       .x0(a_x0[4]), .y0(a_y0[4]),
+                       .x1(a_x1[4]), .y1(a_y1[4]),
+                       .ppln_point(ppln_point), .ppln_line(ppln_line),
+                       .ppln_rect(ppln_rect), .cov(cov_w[4]));
+    gpu_pipelined32_cov u_cov5(.sx(st1_x), .sy(st1_y),
+                       .en(a_en[5]), .ty(a_ty[5]),
+                       .x0(a_x0[5]), .y0(a_y0[5]),
+                       .x1(a_x1[5]), .y1(a_y1[5]),
+                       .ppln_point(ppln_point), .ppln_line(ppln_line),
+                       .ppln_rect(ppln_rect), .cov(cov_w[5]));
+    gpu_pipelined32_cov u_cov6(.sx(st1_x), .sy(st1_y),
+                       .en(a_en[6]), .ty(a_ty[6]),
+                       .x0(a_x0[6]), .y0(a_y0[6]),
+                       .x1(a_x1[6]), .y1(a_y1[6]),
+                       .ppln_point(ppln_point), .ppln_line(ppln_line),
+                       .ppln_rect(ppln_rect), .cov(cov_w[6]));
+    gpu_pipelined32_cov u_cov7(.sx(st1_x), .sy(st1_y),
+                       .en(a_en[7]), .ty(a_ty[7]),
+                       .x0(a_x0[7]), .y0(a_y0[7]),
+                       .x1(a_x1[7]), .y1(a_y1[7]),
+                       .ppln_point(ppln_point), .ppln_line(ppln_line),
+                       .ppln_rect(ppln_rect), .cov(cov_w[7]));
 
     // =========================================================================
     //  STAGE 3 -- COMPOSE: painter priority + output port (handshake here)
+    //  (the colour mux lives in gpu_pipelined32_colmux above)
     // =========================================================================
-    wire [23:0] comp_col =
-          st2_cov[7] ? a_col[7] : st2_cov[6] ? a_col[6]
-        : st2_cov[5] ? a_col[5] : st2_cov[4] ? a_col[4]
-        : st2_cov[3] ? a_col[3] : st2_cov[2] ? a_col[2]
-        : st2_cov[1] ? a_col[1] : st2_cov[0] ? a_col[0] : 24'd0;
-    wire [23:0] comp_rgb = ctl_fill ? fill_col : comp_col;
+    wire [23:0] comp_rgb;
+    gpu_pipelined32_colmux u_colmux(
+        .cov(st2_cov),
+        .col0(a_col[0]), .col1(a_col[1]), .col2(a_col[2]), .col3(a_col[3]),
+        .col4(a_col[4]), .col5(a_col[5]), .col6(a_col[6]), .col7(a_col[7]),
+        .ctl_fill(ctl_fill), .fill_col(fill_col),
+        .comp_rgb(comp_rgb)
+    );
 
     //  back-pressure: the output pixel may only leave when the screen is
     //  ready (or we're free-running); otherwise the WHOLE pipe freezes.

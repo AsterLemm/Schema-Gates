@@ -6,10 +6,66 @@
 //  steps them purely incrementally (E += A per pixel, +B per row) --
 //  the exact technique of the flagship GPU.v polygon path. Coverage =
 //  all three edge values share a sign. Row-serial 64-bit scanout.
+//  MODULAR: per-slot sign-test leaves, an edge-seed unit, and a
+//  seed-index decoder are drillable submodules.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
+
+// --- gpu_raster64_sgn : one triangle slot's edge sign test ---
+// inside when E0,E1,E2 are all >= 0 or all <= 0 (winding-independent,
+// edge-inclusive). Disabled slots are operand-isolated by `en`.
+module gpu_raster64_sgn(
+    input  wire               en,
+    input  wire signed [15:0] e0,
+    input  wire signed [15:0] e1,
+    input  wire signed [15:0] e2,
+    output wire               allp,
+    output wire               alln
+);
+    wire s0 = e0[15];   // sign bits
+    wire s1 = e1[15];
+    wire s2 = e2[15];
+    wire z0 = (e0 == 16'sd0);
+    wire z1 = (e1 == 16'sd0);
+    wire z2 = (e2 == 16'sd0);
+    assign allp = en & (~s0 | z0) & (~s1 | z1) & (~s2 | z2);
+    assign alln = en & ( s0 | z0) & ( s1 | z1) & ( s2 | z2);
+endmodule
+
+// --- gpu_raster64_seed : edge coefficients for one edge (xk,yk)->(xn,yn) ---
+// A = dy, B = -dx, C = E(0,0) -- the ONLY multiplies in the design.
+module gpu_raster64_seed(
+    input  wire signed [15:0] xk,
+    input  wire signed [15:0] yk,
+    input  wire signed [15:0] xn,
+    input  wire signed [15:0] yn,
+    output wire signed [15:0] eA,
+    output wire signed [15:0] eB,
+    output wire signed [15:0] eC
+);
+    assign eA = yn - yk;                 // A =  dy
+    assign eB = xk - xn;                 // B = -dx
+    assign eC = yk * xn - xk * yn;       // C = E(0,0)
+endmodule
+
+// --- gpu_raster64_sdidx : which slot/vertex does edge seed_i belong to ---
+// edge seed_i joins vertex k of slot seed_i/3 to vertex (k+1) mod 3
+module gpu_raster64_sdidx(
+    input  wire [3:0] seed_i,
+    output wire [1:0] sd_slot,
+    output wire [1:0] sd_k,
+    output wire [1:0] sd_kn
+);
+    assign sd_slot = (seed_i >= 4'd9) ? 2'd3 :
+                     (seed_i >= 4'd6) ? 2'd2 :
+                     (seed_i >= 4'd3) ? 2'd1 : 2'd0;
+    assign sd_k    = (seed_i >= 4'd9) ? (seed_i - 4'd9)
+                   : (seed_i >= 4'd6) ? (seed_i - 4'd6)
+                   : (seed_i >= 4'd3) ? (seed_i - 4'd3) : seed_i;
+    assign sd_kn   = (sd_k == 2'd2) ? 2'd0 : (sd_k + 2'd1);
+endmodule
 
 //  gpu_raster64: 4 triangle slots on a 64x64 monochrome screen.
 //
@@ -87,20 +143,20 @@ module gpu_raster64 (
     reg signed [15:0] e_row [0:11];
     reg signed [15:0] e_cur [0:11];
 
-    // ---- coverage at the current pixel (operand-isolated per slot) ---------
-    //  sign test only: no arithmetic on parked slots' values is performed.
+    // ---- coverage at the current pixel (one gpu_raster64_sgn leaf per slot) ------
     wire [3:0] allp, alln;
-    genvar g;
-    generate for (g = 0; g < 4; g = g + 1) begin : SGN
-        wire s0 = e_cur[g*3+0][15];   // sign bits
-        wire s1 = e_cur[g*3+1][15];
-        wire s2 = e_cur[g*3+2][15];
-        wire z0 = (e_cur[g*3+0] == 16'sd0);
-        wire z1 = (e_cur[g*3+1] == 16'sd0);
-        wire z2 = (e_cur[g*3+2] == 16'sd0);
-        assign allp[g] = a_en[g] & (~s0 | z0) & (~s1 | z1) & (~s2 | z2);
-        assign alln[g] = a_en[g] & ( s0 | z0) & ( s1 | z1) & ( s2 | z2);
-    end endgenerate
+    gpu_raster64_sgn u_sgn0(.en(a_en[0]),
+                       .e0(e_cur[0]), .e1(e_cur[1]), .e2(e_cur[2]),
+                       .allp(allp[0]), .alln(alln[0]));
+    gpu_raster64_sgn u_sgn1(.en(a_en[1]),
+                       .e0(e_cur[3]), .e1(e_cur[4]), .e2(e_cur[5]),
+                       .allp(allp[1]), .alln(alln[1]));
+    gpu_raster64_sgn u_sgn2(.en(a_en[2]),
+                       .e0(e_cur[6]), .e1(e_cur[7]), .e2(e_cur[8]),
+                       .allp(allp[2]), .alln(alln[2]));
+    gpu_raster64_sgn u_sgn3(.en(a_en[3]),
+                       .e0(e_cur[9]), .e1(e_cur[10]), .e2(e_cur[11]),
+                       .allp(allp[3]), .alln(alln[3]));
     wire covered = |(allp | alln);
     wire pix_on  = ctl_fill | covered;
 
@@ -117,19 +173,18 @@ module gpu_raster64 (
     reg busy;
     integer i;
 
-    // seeding helpers: edge seed_i belongs to slot seed_i/3, joins vertex k
-    // to vertex (k+1) mod 3
-    wire [1:0] sd_slot = (seed_i >= 4'd9) ? 2'd3 :
-                         (seed_i >= 4'd6) ? 2'd2 :
-                         (seed_i >= 4'd3) ? 2'd1 : 2'd0;
-    wire [1:0] sd_k    = (seed_i >= 4'd9) ? (seed_i - 4'd9)
-                       : (seed_i >= 4'd6) ? (seed_i - 4'd6)
-                       : (seed_i >= 4'd3) ? (seed_i - 4'd3) : seed_i;
-    wire [1:0] sd_kn   = (sd_k == 2'd2) ? 2'd0 : (sd_k + 2'd1);
+    // seeding helpers: index decode + vertex fetch + coefficient math
+    // (edge seed_i belongs to slot seed_i/3, joins vertex k to (k+1) mod 3)
+    wire [1:0] sd_slot, sd_k, sd_kn;
+    gpu_raster64_sdidx u_sdidx(.seed_i(seed_i),
+                         .sd_slot(sd_slot), .sd_k(sd_k), .sd_kn(sd_kn));
     wire signed [15:0] xk = {10'd0, a_vx[{sd_slot, sd_k }]};
     wire signed [15:0] yk = {10'd0, a_vy[{sd_slot, sd_k }]};
     wire signed [15:0] xn = {10'd0, a_vx[{sd_slot, sd_kn}]};
     wire signed [15:0] yn = {10'd0, a_vy[{sd_slot, sd_kn}]};
+    wire signed [15:0] sd_eA, sd_eB, sd_eC;
+    gpu_raster64_seed u_seed(.xk(xk), .yk(yk), .xn(xn), .yn(yn),
+                       .eA(sd_eA), .eB(sd_eB), .eC(sd_eC));
 
     always @(posedge clk) begin
         if (reset) begin
@@ -190,11 +245,12 @@ module gpu_raster64 (
             end
 
             // ---- seed pass: the only multiplies, one edge per cycle ---------
+            // (the coefficient math itself lives in u_seed above)
             S_SEED: begin
-                e_A  [seed_i] <= yn - yk;                 // A =  dy
-                e_B  [seed_i] <= xk - xn;                 // B = -dx
-                e_row[seed_i] <= yk * xn - xk * yn;       // C = E(0,0)
-                e_cur[seed_i] <= yk * xn - xk * yn;
+                e_A  [seed_i] <= sd_eA;                   // A =  dy
+                e_B  [seed_i] <= sd_eB;                   // B = -dx
+                e_row[seed_i] <= sd_eC;                   // C = E(0,0)
+                e_cur[seed_i] <= sd_eC;
                 if (seed_i == 4'd11) begin
                     cur_x <= 6'd0; cur_y <= 6'd0; rowbits <= 64'd0;
                     state <= S_PIX;

@@ -9,6 +9,10 @@
 //  scene and streamed to the screen ("racing the beam"), so the cost is logic,
 //  not RAM.
 //
+//  MODULAR (DigitalJS-style hierarchy): GPU_sin (x6), GPU_cfgdec,
+//  GPU_slot_cov (x4), GPU_compose are drillable submodules; the shared-
+//  multiplier transform/edge FSM stays in the top (it time-multiplexes
+//  4 multipliers across all stages by design).
 //  ---------------------------------------------------------------------------
 //  CPU INTERFACE (memory-mapped slave, driven by Memory_And_MMIO):
 //     gpu_we / gpu_addr[3:0] / gpu_wdata[31:0]  -> register writes
@@ -54,6 +58,247 @@
 //     otherwise the GPU free-runs (one step/clock) and you slow the clock.
 //     frame_start / frame_done pulse at the scan boundaries.
 // ============================================================================
+
+// ===========================================================================
+//  GPU submodules (DigitalJS-style drillable hierarchy)
+//  Every expression below is carried over verbatim from the previous
+//  monolithic body; only the module boundaries are new.
+// ===========================================================================
+
+// --- GPU_sin : Q1.8 sine LUT (256 = 1.0) -- one instance per trig value ---
+module GPU_sin(
+    input  wire [7:0]         a,
+    output reg signed [10:0]  s
+);
+    reg [1:0] q; reg [5:0] p; reg [6:0] idx; reg neg; reg signed [10:0] m;
+    always @(*) begin
+        q = a[7:6]; p = a[5:0];
+        case (q)
+            2'd0: begin idx = {1'b0,p};        neg = 1'b0; end
+            2'd1: begin idx = 7'd64-{1'b0,p};  neg = 1'b0; end
+            2'd2: begin idx = {1'b0,p};        neg = 1'b1; end
+            default: begin idx = 7'd64-{1'b0,p}; neg = 1'b1; end
+        endcase
+        case (idx)
+    7'd0: m = 11'sd0;
+    7'd1: m = 11'sd6;
+    7'd2: m = 11'sd13;
+    7'd3: m = 11'sd19;
+    7'd4: m = 11'sd25;
+    7'd5: m = 11'sd31;
+    7'd6: m = 11'sd38;
+    7'd7: m = 11'sd44;
+    7'd8: m = 11'sd50;
+    7'd9: m = 11'sd56;
+    7'd10: m = 11'sd62;
+    7'd11: m = 11'sd68;
+    7'd12: m = 11'sd74;
+    7'd13: m = 11'sd80;
+    7'd14: m = 11'sd86;
+    7'd15: m = 11'sd92;
+    7'd16: m = 11'sd98;
+    7'd17: m = 11'sd104;
+    7'd18: m = 11'sd109;
+    7'd19: m = 11'sd115;
+    7'd20: m = 11'sd121;
+    7'd21: m = 11'sd126;
+    7'd22: m = 11'sd132;
+    7'd23: m = 11'sd137;
+    7'd24: m = 11'sd142;
+    7'd25: m = 11'sd147;
+    7'd26: m = 11'sd152;
+    7'd27: m = 11'sd157;
+    7'd28: m = 11'sd162;
+    7'd29: m = 11'sd167;
+    7'd30: m = 11'sd172;
+    7'd31: m = 11'sd177;
+    7'd32: m = 11'sd181;
+    7'd33: m = 11'sd185;
+    7'd34: m = 11'sd190;
+    7'd35: m = 11'sd194;
+    7'd36: m = 11'sd198;
+    7'd37: m = 11'sd202;
+    7'd38: m = 11'sd206;
+    7'd39: m = 11'sd209;
+    7'd40: m = 11'sd213;
+    7'd41: m = 11'sd216;
+    7'd42: m = 11'sd220;
+    7'd43: m = 11'sd223;
+    7'd44: m = 11'sd226;
+    7'd45: m = 11'sd229;
+    7'd46: m = 11'sd231;
+    7'd47: m = 11'sd234;
+    7'd48: m = 11'sd237;
+    7'd49: m = 11'sd239;
+    7'd50: m = 11'sd241;
+    7'd51: m = 11'sd243;
+    7'd52: m = 11'sd245;
+    7'd53: m = 11'sd247;
+    7'd54: m = 11'sd248;
+    7'd55: m = 11'sd250;
+    7'd56: m = 11'sd251;
+    7'd57: m = 11'sd252;
+    7'd58: m = 11'sd253;
+    7'd59: m = 11'sd254;
+    7'd60: m = 11'sd255;
+    7'd61: m = 11'sd255;
+    7'd62: m = 11'sd256;
+    7'd63: m = 11'sd256;
+    7'd64: m = 11'sd256;
+            default: m = 11'sd0;
+        endcase
+        s = neg ? -m : m;
+    end
+endmodule
+
+// --- GPU_cfgdec : CONFIG decode (resolution clamp, mode one-hots) ---
+// One-hot decode of the colour-type field. Each mode line is broadcast as
+// an AND mask onto the operands of that mode's datapath, so only the
+// selected colour pipeline ever toggles (the others stay frozen at 0).
+// Same idea as the ALU's sel_* lines, applied to the GPU config.
+module GPU_cfgdec(
+    input  wire [7:0]  cfg_w,
+    input  wire [7:0]  cfg_h,
+    input  wire [1:0]  cfg_ctype,
+    input  wire        cfg_proj,
+    output wire [8:0]  res_w,
+    output wire [8:0]  res_h,
+    output wire        is_mono,
+    output wire signed [11:0] cx,
+    output wire signed [11:0] cy,
+    output wire        mode_mono,
+    output wire        mode_mux,
+    output wire        mode_rgb12,
+    output wire        mode_rgb24,
+    output wire        mode_rgb,
+    output wire        proj_iso,
+    output wire        proj_ortho
+);
+    // active resolution (color modes clamp to 32x32)
+    wire [8:0] res_w_full = {1'b0,cfg_w} + 9'd1;          // 1..256
+    wire [8:0] res_h_full = {1'b0,cfg_h} + 9'd1;
+    assign is_mono    = (cfg_ctype == 2'b00);
+    assign res_w      = is_mono ? res_w_full : (res_w_full > 9'd32 ? 9'd32 : res_w_full);
+    assign res_h      = is_mono ? res_h_full : (res_h_full > 9'd32 ? 9'd32 : res_h_full);
+    assign cx = $signed({1'b0,res_w[8:1]});  // screen centre x (W/2)
+    assign cy = $signed({1'b0,res_h[8:1]});  // screen centre y (H/2)
+
+    assign mode_mono  = (cfg_ctype == 2'b00);
+    assign mode_mux   = (cfg_ctype == 2'b01);
+    assign mode_rgb12 = (cfg_ctype == 2'b10);
+    assign mode_rgb24 = (cfg_ctype == 2'b11);
+    assign mode_rgb   = mode_rgb12 | mode_rgb24;     // either RGB depth
+    assign proj_iso   = cfg_proj;                    // isometric  skew active
+    assign proj_ortho = ~cfg_proj;                   // orthographic (no skew)
+endmodule
+
+// --- GPU_slot_cov : per-pixel coverage for ONE primitive slot ---
+// Same evaluator as the old in-line loop: edge sign accumulation for
+// filled polygons, near-edge test for outlines/lines, exact match for
+// points. pixel_en is the PROCESS GATE; en is the slot's OPERAND gate.
+module GPU_slot_cov(
+    input  wire                 pixel_en,
+    input  wire                 en,
+    input  wire [1:0]           ptype,
+    input  wire                 pfill,
+    input  wire [3:0]           pvcnt,
+    input  wire [8:0]           cur_x,
+    input  wire [8:0]           cur_y,
+    input  wire signed [11:0]   px2b,     // projected base vertex (points)
+    input  wire signed [11:0]   py2b,
+    input  wire [8*32-1:0]      eE_flat,  // this slot's 8 edge accumulators
+    input  wire [8*32-1:0]      edot_flat,
+    input  wire [8*32-1:0]      eseg2_flat,
+    input  wire [8*13-1:0]      emab_flat,
+    output wire                 cov
+);
+    localparam CW = 12;
+    localparam EW = 32;
+    localparam T_POINT = 2'd0, T_LINE = 2'd1, T_POLY = 2'd2;
+
+    reg allpos, allneg, onedge;
+    reg covered;
+    integer k;
+    reg signed [EW-1:0] Ev, av, dv, sg;
+    reg signed [CW:0]   mb;
+
+    always @(*) begin
+        allpos = 1'b1; allneg = 1'b1; onedge = 1'b0;
+        covered = 1'b0;
+        // PROCESS GATE + OPERAND ISOLATION: frozen unless a pixel is being
+        // produced AND this slot is enabled (exactly as before).
+        if (pixel_en && en) begin
+            for (k = 0; k < 8; k = k + 1) begin
+                if (k < pvcnt) begin
+                    Ev = eE_flat[k*EW +: EW];
+                    mb = emab_flat[k*13 +: 13];
+                    dv = edot_flat[k*EW +: EW];
+                    sg = eseg2_flat[k*EW +: EW];
+                    av = (Ev[EW-1]) ? -Ev : Ev;
+                    if (Ev <  0) allpos = 1'b0;
+                    if (Ev >  0) allneg = 1'b0;
+                    if ((av <= {{(EW-CW-1){1'b0}}, mb}) &&
+                        (dv >= 0) && (dv <= sg))
+                        onedge = 1'b1;
+                end
+            end
+            case (ptype)
+                T_POINT: covered = (cur_x == px2b[8:0]) &&
+                                   (cur_y == py2b[8:0]);
+                T_LINE:  covered = onedge;
+                default: covered = pfill ? (allpos | allneg) : onedge;
+            endcase
+        end
+    end
+    assign cov = covered;
+endmodule
+
+// --- GPU_compose : painter priority + colour source select ---
+// higher slot index overwrites (painter algorithm), then the FILL
+// override and the per-mode masking / RGB12->24 expansion.
+module GPU_compose(
+    input  wire [3:0]   cov,
+    input  wire [23:0]  pcol0,
+    input  wire [23:0]  pcol1,
+    input  wire [23:0]  pcol2,
+    input  wire [23:0]  pcol3,
+    input  wire         ctl_fill,
+    input  wire [23:0]  fill_color,
+    input  wire         mode_mux,
+    input  wire         mode_rgb,
+    input  wire [1:0]   cfg_ctype,
+    output wire         cov_any,
+    output wire [23:0]  px_rgb_w,
+    output wire [3:0]   px_mux_w,
+    output wire         pix_on_mono
+);
+    // expand a stored colour to 24-bit RGB according to colour mode
+    function [23:0] rgb_expand;
+        input [23:0] c; input [1:0] ct;
+        begin
+            case (ct)
+                2'b10: rgb_expand = {c[11:8],c[11:8], c[7:4],c[7:4], c[3:0],c[3:0]}; // RGB12->24
+                default: rgb_expand = c[23:0];                                       // RGB24
+            endcase
+        end
+    endfunction
+
+    // higher slot index overwrites (painter) -- same result as the old
+    // ascending overwrite loop
+    assign cov_any = cov[3] | cov[2] | cov[1] | cov[0];
+    wire [23:0] cov_col = cov[3] ? pcol3 : cov[2] ? pcol2
+                        : cov[1] ? pcol1 : cov[0] ? pcol0 : 24'd0;
+
+    wire [23:0] pix_rgb_src  = ctl_fill ? fill_color : cov_col;
+    wire [3:0]  pix_mux_src  = ctl_fill ? fill_color[3:0] : cov_col[3:0];
+    assign pix_on_mono = ctl_fill ? fill_color[0]   : cov_any;
+
+    // CONFIG GATE: the MUX index path and the RGB-expand path are each
+    // masked by their mode line, so only the selected colour pipeline
+    // toggles. (rgb_expand sees 0 in MUX mode.)
+    assign px_mux_w = pix_mux_src & {4{mode_mux}};
+    assign px_rgb_w = rgb_expand(pix_rgb_src & {24{mode_rgb}}, cfg_ctype);
+endmodule
 
 module GPU (
     input              clk,
@@ -145,27 +390,24 @@ module GPU (
     assign enable    = ctl_enable;
     assign fill      = ctl_fill;
 
-    // active resolution (color modes clamp to 32x32)
-    wire [8:0] res_w_full = {1'b0,cfg_w} + 9'd1;          // 1..256
-    wire [8:0] res_h_full = {1'b0,cfg_h} + 9'd1;
-    wire       is_mono    = (cfg_ctype == 2'b00);
-    wire [8:0] res_w      = is_mono ? res_w_full : (res_w_full > 9'd32 ? 9'd32 : res_w_full);
-    wire [8:0] res_h      = is_mono ? res_h_full : (res_h_full > 9'd32 ? 9'd32 : res_h_full);
-    wire signed [CW-1:0] cx = $signed({1'b0,res_w[8:1]});  // screen centre x (W/2)
-    wire signed [CW-1:0] cy = $signed({1'b0,res_h[8:1]});  // screen centre y (H/2)
-
-    // ---------------- CONFIG FRONT-MUX (operand isolation by mode) ----------
-    // One-hot decode of the colour-type field. Each mode line is broadcast as
-    // an AND mask onto the operands of that mode's datapath, so only the
-    // selected colour pipeline ever toggles (the others stay frozen at 0).
-    // Same idea as the ALU's sel_* lines, applied to the GPU config.
-    wire mode_mono  = (cfg_ctype == 2'b00);
-    wire mode_mux   = (cfg_ctype == 2'b01);
-    wire mode_rgb12 = (cfg_ctype == 2'b10);
-    wire mode_rgb24 = (cfg_ctype == 2'b11);
-    wire mode_rgb   = mode_rgb12 | mode_rgb24;     // either RGB depth
-    wire proj_iso   = cfg_proj;                    // isometric  skew active
-    wire proj_ortho = ~cfg_proj;                   // orthographic (no skew)
+    // ---------------- CONFIG decode + FRONT-MUX (GPU_cfgdec) ----------------
+    // resolution clamp, screen centre, mode one-hots, projection select --
+    // see the GPU_cfgdec module above (expressions carried over verbatim).
+    wire [8:0] res_w, res_h;
+    wire       is_mono;
+    wire signed [CW-1:0] cx, cy;
+    wire mode_mono, mode_mux, mode_rgb12, mode_rgb24, mode_rgb;
+    wire proj_iso, proj_ortho;
+    GPU_cfgdec u_cfgdec(
+        .cfg_w(cfg_w), .cfg_h(cfg_h),
+        .cfg_ctype(cfg_ctype), .cfg_proj(cfg_proj),
+        .res_w(res_w), .res_h(res_h), .is_mono(is_mono),
+        .cx(cx), .cy(cy),
+        .mode_mono(mode_mono), .mode_mux(mode_mux),
+        .mode_rgb12(mode_rgb12), .mode_rgb24(mode_rgb24),
+        .mode_rgb(mode_rgb),
+        .proj_iso(proj_iso), .proj_ortho(proj_ortho)
+    );
     reg               p_en   [0:MAX_PRIM-1];   // slot enable (scene store)
     reg  [1:0]        p_type [0:MAX_PRIM-1];
     reg               p_is3d [0:MAX_PRIM-1];
@@ -192,92 +434,16 @@ module GPU (
 
     integer i;
 
-    // ---------------- sine LUT (Q1.8 ; 256=1.0) -----------------------------
-    function signed [10:0] sinv;
-        input [7:0] a;
-        reg [1:0] q; reg [5:0] p; reg [6:0] idx; reg neg; reg signed [10:0] m;
-        begin
-            q = a[7:6]; p = a[5:0];
-            case (q)
-                2'd0: begin idx = {1'b0,p};        neg = 1'b0; end
-                2'd1: begin idx = 7'd64-{1'b0,p};  neg = 1'b0; end
-                2'd2: begin idx = {1'b0,p};        neg = 1'b1; end
-                default: begin idx = 7'd64-{1'b0,p}; neg = 1'b1; end
-            endcase
-            case (idx)
-        7'd0: m = 11'sd0;
-        7'd1: m = 11'sd6;
-        7'd2: m = 11'sd13;
-        7'd3: m = 11'sd19;
-        7'd4: m = 11'sd25;
-        7'd5: m = 11'sd31;
-        7'd6: m = 11'sd38;
-        7'd7: m = 11'sd44;
-        7'd8: m = 11'sd50;
-        7'd9: m = 11'sd56;
-        7'd10: m = 11'sd62;
-        7'd11: m = 11'sd68;
-        7'd12: m = 11'sd74;
-        7'd13: m = 11'sd80;
-        7'd14: m = 11'sd86;
-        7'd15: m = 11'sd92;
-        7'd16: m = 11'sd98;
-        7'd17: m = 11'sd104;
-        7'd18: m = 11'sd109;
-        7'd19: m = 11'sd115;
-        7'd20: m = 11'sd121;
-        7'd21: m = 11'sd126;
-        7'd22: m = 11'sd132;
-        7'd23: m = 11'sd137;
-        7'd24: m = 11'sd142;
-        7'd25: m = 11'sd147;
-        7'd26: m = 11'sd152;
-        7'd27: m = 11'sd157;
-        7'd28: m = 11'sd162;
-        7'd29: m = 11'sd167;
-        7'd30: m = 11'sd172;
-        7'd31: m = 11'sd177;
-        7'd32: m = 11'sd181;
-        7'd33: m = 11'sd185;
-        7'd34: m = 11'sd190;
-        7'd35: m = 11'sd194;
-        7'd36: m = 11'sd198;
-        7'd37: m = 11'sd202;
-        7'd38: m = 11'sd206;
-        7'd39: m = 11'sd209;
-        7'd40: m = 11'sd213;
-        7'd41: m = 11'sd216;
-        7'd42: m = 11'sd220;
-        7'd43: m = 11'sd223;
-        7'd44: m = 11'sd226;
-        7'd45: m = 11'sd229;
-        7'd46: m = 11'sd231;
-        7'd47: m = 11'sd234;
-        7'd48: m = 11'sd237;
-        7'd49: m = 11'sd239;
-        7'd50: m = 11'sd241;
-        7'd51: m = 11'sd243;
-        7'd52: m = 11'sd245;
-        7'd53: m = 11'sd247;
-        7'd54: m = 11'sd248;
-        7'd55: m = 11'sd250;
-        7'd56: m = 11'sd251;
-        7'd57: m = 11'sd252;
-        7'd58: m = 11'sd253;
-        7'd59: m = 11'sd254;
-        7'd60: m = 11'sd255;
-        7'd61: m = 11'sd255;
-        7'd62: m = 11'sd256;
-        7'd63: m = 11'sd256;
-        7'd64: m = 11'sd256;
-                default: m = 11'sd0;
-            endcase
-            sinv = neg ? -m : m;
-        end
-    endfunction
-
-    // trig values latched for the current frame
+    // trig values latched for the current frame; the Q1.8 sine LUT lives
+    // in GPU_sin above (one instance per value, cos(a) = sin(a+64))
     reg signed [10:0] sx_, cx_, sy_, cy_, sz_, cz_;
+    wire signed [10:0] sin_ax, cos_ax, sin_ay, cos_ay, sin_az, cos_az;
+    GPU_sin u_sin_ax(.a(rot_ax),          .s(sin_ax));
+    GPU_sin u_cos_ax(.a(rot_ax + 8'd64),  .s(cos_ax));
+    GPU_sin u_sin_ay(.a(rot_ay),          .s(sin_ay));
+    GPU_sin u_cos_ay(.a(rot_ay + 8'd64),  .s(cos_ay));
+    GPU_sin u_sin_az(.a(rot_az),          .s(sin_az));
+    GPU_sin u_cos_az(.a(rot_az + 8'd64),  .s(cos_az));
 
     // ---------------- main FSM ----------------------------------------------
     localparam S_IDLE   = 4'd0,
@@ -322,71 +488,80 @@ module GPU (
     reg signed [CW-1:0] x0e, y0e, x1e, y1e, dxe, dye;
 
     // ----- combinational per-pixel coverage over the scene ------------------
-    reg               cov_any;
-    reg [23:0]        cov_col;
-    reg               s_any; reg [23:0] s_col;
-    integer ss, k, base;
-    reg allpos, allneg, onedge;
-    reg signed [EW-1:0] Ev, av, dv, sg;
-    reg signed [CW:0]   mb;
-    reg covered;
+    // one GPU_slot_cov instance per primitive slot (the old in-line loop,
+    // see the module above), then GPU_compose for painter priority + the
+    // colour source select. The edge arrays are packed onto flat buses so
+    // the slot units can receive them through ports.
+    genvar gk;
+    wire [NE*EW-1:0]   eE_flat;
+    wire [NE*EW-1:0]   edot_flat;
+    wire [NE*EW-1:0]   eseg2_flat;
+    wire [NE*13-1:0]   emab_flat;
+    generate for (gk = 0; gk < NE; gk = gk + 1) begin : PACK
+        assign eE_flat   [gk*EW +: EW] = e_E   [gk];
+        assign edot_flat [gk*EW +: EW] = e_dot [gk];
+        assign eseg2_flat[gk*EW +: EW] = e_seg2[gk];
+        assign emab_flat [gk*13 +: 13] = e_mab [gk];
+    end endgenerate
 
-    always @(*) begin
-        cov_any = 1'b0;
-        cov_col = 24'd0;
-        // PROCESS GATE: this whole evaluator is frozen unless a pixel is being
-        // produced, so it does not toggle during edge-seed / setup / idle.
-        if (pixel_en) begin
-        for (ss = 0; ss < MAX_PRIM; ss = ss + 1) begin
-            base   = ss*MAX_VERT;
-            allpos = 1'b1; allneg = 1'b1; onedge = 1'b0;
-            covered = 1'b0;
-            // OPERAND ISOLATION: a disabled slot is skipped entirely, so its
-            // comparator chain receives no live data and stays inactive.
-            if (p_en[ss]) begin
-                for (k = 0; k < MAX_VERT; k = k + 1) begin
-                    if (k < p_vcnt[ss]) begin
-                        Ev = e_E[base+k];
-                        mb = e_mab[base+k];
-                        dv = e_dot[base+k];
-                        sg = e_seg2[base+k];
-                        av = (Ev[EW-1]) ? -Ev : Ev;
-                        if (Ev <  0) allpos = 1'b0;
-                        if (Ev >  0) allneg = 1'b0;
-                        if ((av <= {{(EW-CW-1){1'b0}}, mb}) &&
-                            (dv >= 0) && (dv <= sg))
-                            onedge = 1'b1;
-                    end
-                end
-                case (p_type[ss])
-                    T_POINT: covered = (cur_x == px2[base][8:0]) &&
-                                       (cur_y == py2[base][8:0]);
-                    T_LINE:  covered = onedge;
-                    default: covered = p_fill[ss] ? (allpos | allneg) : onedge;
-                endcase
-            end
-            if (covered) begin           // higher slot index overwrites (painter)
-                cov_any = 1'b1;
-                cov_col = p_col[ss];
-            end
-        end
-        end
-    end
+    wire pixel_en_w = pixel_en;
+    wire [3:0] cov;
+    GPU_slot_cov u_cov0(
+        .pixel_en(pixel_en_w), .en(p_en[0]), .ptype(p_type[0]),
+        .pfill(p_fill[0]), .pvcnt(p_vcnt[0]),
+        .cur_x(cur_x), .cur_y(cur_y),
+        .px2b(px2[0*MAX_VERT]), .py2b(py2[0*MAX_VERT]),
+        .eE_flat(eE_flat[0*8*EW +: 8*EW]),
+        .edot_flat(edot_flat[0*8*EW +: 8*EW]),
+        .eseg2_flat(eseg2_flat[0*8*EW +: 8*EW]),
+        .emab_flat(emab_flat[0*8*13 +: 8*13]),
+        .cov(cov[0]));
+    GPU_slot_cov u_cov1(
+        .pixel_en(pixel_en_w), .en(p_en[1]), .ptype(p_type[1]),
+        .pfill(p_fill[1]), .pvcnt(p_vcnt[1]),
+        .cur_x(cur_x), .cur_y(cur_y),
+        .px2b(px2[1*MAX_VERT]), .py2b(py2[1*MAX_VERT]),
+        .eE_flat(eE_flat[1*8*EW +: 8*EW]),
+        .edot_flat(edot_flat[1*8*EW +: 8*EW]),
+        .eseg2_flat(eseg2_flat[1*8*EW +: 8*EW]),
+        .emab_flat(emab_flat[1*8*13 +: 8*13]),
+        .cov(cov[1]));
+    GPU_slot_cov u_cov2(
+        .pixel_en(pixel_en_w), .en(p_en[2]), .ptype(p_type[2]),
+        .pfill(p_fill[2]), .pvcnt(p_vcnt[2]),
+        .cur_x(cur_x), .cur_y(cur_y),
+        .px2b(px2[2*MAX_VERT]), .py2b(py2[2*MAX_VERT]),
+        .eE_flat(eE_flat[2*8*EW +: 8*EW]),
+        .edot_flat(edot_flat[2*8*EW +: 8*EW]),
+        .eseg2_flat(eseg2_flat[2*8*EW +: 8*EW]),
+        .emab_flat(emab_flat[2*8*13 +: 8*13]),
+        .cov(cov[2]));
+    GPU_slot_cov u_cov3(
+        .pixel_en(pixel_en_w), .en(p_en[3]), .ptype(p_type[3]),
+        .pfill(p_fill[3]), .pvcnt(p_vcnt[3]),
+        .cur_x(cur_x), .cur_y(cur_y),
+        .px2b(px2[3*MAX_VERT]), .py2b(py2[3*MAX_VERT]),
+        .eE_flat(eE_flat[3*8*EW +: 8*EW]),
+        .edot_flat(edot_flat[3*8*EW +: 8*EW]),
+        .eseg2_flat(eseg2_flat[3*8*EW +: 8*EW]),
+        .emab_flat(emab_flat[3*8*13 +: 8*13]),
+        .cov(cov[3]));
 
-    // expand a stored colour to 24-bit RGB according to colour mode
-    function [23:0] rgb_expand;
-        input [23:0] c; input [1:0] ct;
-        begin
-            case (ct)
-                2'b10: rgb_expand = {c[11:8],c[11:8], c[7:4],c[7:4], c[3:0],c[3:0]}; // RGB12->24
-                default: rgb_expand = c[23:0];                                       // RGB24
-            endcase
-        end
-    endfunction
-
-    wire [23:0] pix_rgb_src  = ctl_fill ? fill_color : cov_col;
-    wire [3:0]  pix_mux_src  = ctl_fill ? fill_color[3:0] : cov_col[3:0];
-    wire        pix_on_mono  = ctl_fill ? fill_color[0]   : cov_any;
+    wire        cov_any;
+    wire [23:0] px_rgb_w;
+    wire [3:0]  px_mux_w;
+    wire        pix_on_mono;
+    GPU_compose u_compose(
+        .cov(cov),
+        .pcol0(p_col[0]), .pcol1(p_col[1]),
+        .pcol2(p_col[2]), .pcol3(p_col[3]),
+        .ctl_fill(ctl_fill), .fill_color(fill_color),
+        .mode_mux(mode_mux), .mode_rgb(mode_rgb),
+        .cfg_ctype(cfg_ctype),
+        .cov_any(cov_any),
+        .px_rgb_w(px_rgb_w), .px_mux_w(px_mux_w),
+        .pix_on_mono(pix_on_mono)
+    );
 
     wire advance = (~ctl_wait) | screen_ready;   // free-run unless waiting
 
@@ -460,9 +635,9 @@ module GPU (
 
             // latch sin/cos for this frame
             S_TRIG: begin
-                sx_ <= sinv(rot_ax);  cx_ <= sinv(rot_ax + 8'd64);
-                sy_ <= sinv(rot_ay);  cy_ <= sinv(rot_ay + 8'd64);
-                sz_ <= sinv(rot_az);  cz_ <= sinv(rot_az + 8'd64);
+                sx_ <= sin_ax;  cx_ <= cos_ax;
+                sy_ <= sin_ay;  cy_ <= cos_ay;
+                sz_ <= sin_az;  cz_ <= cos_az;
                 idx_v <= 6'd0; sub <= 2'd0;
                 state <= S_XFORM;
             end
@@ -613,8 +788,8 @@ module GPU (
                     px_valid <= ctl_enable;
                     px_x  <= cur_x[4:0];
                     px_y  <= cur_y[4:0];
-                    px_mux<= pix_mux_src & {4{mode_mux}};
-                    px_rgb<= rgb_expand(pix_rgb_src & {24{mode_rgb}}, cfg_ctype);
+                    px_mux<= px_mux_w;
+                    px_rgb<= px_rgb_w;
                     // consume only a pixel that is already VISIBLE outside
                     // (px_valid is registered): a ready arriving on the
                     // presentation cycle itself must not step the scan, or

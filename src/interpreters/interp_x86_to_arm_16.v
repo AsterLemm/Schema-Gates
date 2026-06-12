@@ -50,39 +50,64 @@
 //    MOVH r,i          MOV rd, rd LSL #8 ; ORR rd,rd,#i
 //    OUT r / HLT       OUT rn / HALT
 //
+//  MODULAR: guest-field decode + the translate cloud are drillable.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
 
-module interp_x86_to_arm_16(
-    // host fetch side: connect to cpu_arm16 imem_addr / imem_data
-    input  wire [7:0]  host_addr,
-    output reg  [31:0] host_instr,
-    // guest program side: connect to the guest binary ROM (64 x 16-bit)
-    output wire [5:0]  guest_addr,
+// --- interp_x86_to_arm_16_gdec : guest field extraction + class decode ---
+// (verbatim from the monolithic body; wire = -> assign =)
+module interp_x86_to_arm_16_gdec(
     input  wire [15:0] guest_instr,
-    // high while feeding HALT for an untranslatable guest instruction
+    output wire [3:0] gop,
+    output wire [1:0] r,
+    output wire [1:0] m,
+    output wire [7:0] imm8,
+    output wire [3:0] cond,
+    output wire [3:0] rr,
+    output wire [3:0] rm
+);
+    // ---- guest field extraction (cpu_x86_16 encoding) -------------------
+    assign gop = guest_instr[15:12];
+    assign r = guest_instr[11:10];
+    assign m = guest_instr[9:8];
+    assign imm8 = guest_instr[7:0];
+    assign cond = {r, m};
+    assign rr = {2'd0, r};                  // guest reg -> host r0..r3
+    assign rm = {2'd0, m};
+
+endmodule
+
+// --- interp_x86_to_arm_16_xlat : the bundle translator (guest -> host words) ---
+// the entire translate cloud of the old monolithic body, carried
+// over verbatim; guest fields come from interp_x86_to_arm_16_gdec inside.
+module interp_x86_to_arm_16_xlat(
+    input  wire [7:0]  host_addr,
+    input  wire [5:0]  gpc,
+    input  wire [1:0]  slot,
+    input  wire [15:0] guest_instr,
+    output reg  [31:0] host_instr,
     output reg         trap
 );
-    // define host_addr    input  255.190.70
-    // define host_instr   output 120.200.255
-    // define guest_addr   output 255.140.60
-    // define guest_instr  input  68.68.242
-    // define trap         output 255.80.80
+    wire [3:0] gop;
+    wire [1:0] r;
+    wire [1:0] m;
+    wire [7:0] imm8;
+    wire [3:0] cond;
+    wire [3:0] rr;
+    wire [3:0] rm;
 
-    wire [5:0] gpc  = host_addr[7:2];
-    wire [1:0] slot = host_addr[1:0];
-    assign guest_addr = gpc;
-
-    // ---- guest field extraction (cpu_x86_16 encoding) -------------------
-    wire [3:0] gop  = guest_instr[15:12];
-    wire [1:0] r    = guest_instr[11:10];
-    wire [1:0] m    = guest_instr[9:8];
-    wire [7:0] imm8 = guest_instr[7:0];
-    wire [3:0] cond = {r, m};
-    wire [3:0] rr   = {2'd0, r};                  // guest reg -> host r0..r3
-    wire [3:0] rm   = {2'd0, m};
+    interp_x86_to_arm_16_gdec u_gdec(
+        .guest_instr(guest_instr),
+        .gop(gop),
+        .r(r),
+        .m(m),
+        .imm8(imm8),
+        .cond(cond),
+        .rr(rr),
+        .rm(rm)
+    );
 
     // ---- host word builders (cpu_arm16 encoding) -------------------------
     localparam [3:0] AL = 4'd14;
@@ -234,4 +259,30 @@ module interp_x86_to_arm_16(
     end
 endmodule
 
+module interp_x86_to_arm_16(
+    // host fetch side: connect to cpu_arm16 imem_addr / imem_data
+    input  wire [7:0]  host_addr,
+    output wire [31:0] host_instr,
+    // guest program side: connect to the guest binary ROM (64 x 16-bit)
+    output wire [5:0]  guest_addr,
+    input  wire [15:0] guest_instr,
+    // high while feeding HALT for an untranslatable guest instruction
+    output wire        trap
+);
+    // define host_addr    input  255.190.70
+    // define host_instr   output 120.200.255
+    // define guest_addr   output 255.140.60
+    // define guest_instr  input  68.68.242
+    // define trap         output 255.80.80
 
+    wire [5:0] gpc  = host_addr[7:2];
+    wire [1:0] slot = host_addr[1:0];
+    assign guest_addr = gpc;
+
+    // the entire translator lives in interp_x86_to_arm_16_xlat above
+    interp_x86_to_arm_16_xlat u_xlat(
+        .host_addr(host_addr), .gpc(gpc), .slot(slot),
+        .guest_instr(guest_instr),
+        .host_instr(host_instr), .trap(trap)
+    );
+endmodule

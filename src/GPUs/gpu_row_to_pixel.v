@@ -27,10 +27,31 @@
 //   * px_on is the pixel bit; px_x counts 0..width-1; px_y echoes the
 //     row's mono_y.
 //
+//  MODULAR: the 256-bit row shift register is a drillable unit.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
+
+// --- gpu_row_to_pixel_sreg : the 256-bit row shift register ---
+// load wins over shift (they never coincide: load fires in ST_IDLE,
+// shift in ST_SHIFT). bit1 exposes row[1], the next pixel after a shift.
+module gpu_row_to_pixel_sreg(
+    input  wire         clk,
+    input  wire         reset,
+    input  wire         load,
+    input  wire [255:0] din,
+    input  wire         shift,
+    output wire         bit1
+);
+    reg [255:0] row;
+    assign bit1 = row[1];
+    always @(posedge clk) begin
+        if (reset)      row <= 256'd0;
+        else if (load)  row <= din;
+        else if (shift) row <= {1'b0, row[255:1]};
+    end
+endmodule
 
 module gpu_row_to_pixel(
     input  wire        clk,
@@ -72,15 +93,24 @@ module gpu_row_to_pixel(
     localparam ST_SHIFT = 1'b1;     // emitting pixels
 
     reg         state;
-    reg [255:0] row;
     reg [7:0]   xcnt;
+
+    // the 256-bit row register lives in gpu_row_to_pixel_sreg above;
+    // load/shift conditions are exactly the old in-line assignments.
+    wire row_bit1;
+    gpu_row_to_pixel_sreg u_sreg(
+        .clk(clk), .reset(reset),
+        .load((state == ST_IDLE) && mono_valid),
+        .din({mono_s3, mono_s2, mono_s1, mono_s0}),
+        .shift((state == ST_SHIFT) && px_ready && (xcnt != w_field)),
+        .bit1(row_bit1)
+    );
 
     assign row_ready = (state == ST_IDLE) && !reset;
 
     always @(posedge clk) begin
         if (reset) begin
             state    <= ST_IDLE;
-            row      <= 256'd0;
             xcnt     <= 8'd0;
             px_valid <= 1'b0;
             px_x     <= 8'd0;
@@ -91,7 +121,7 @@ module gpu_row_to_pixel(
                 ST_IDLE: begin
                     px_valid <= 1'b0;
                     if (mono_valid) begin
-                        row      <= {mono_s3, mono_s2, mono_s1, mono_s0};
+                        // (the row latch itself lives in u_sreg)
                         px_y     <= mono_y;
                         xcnt     <= 8'd0;
                         px_x     <= 8'd0;
@@ -106,10 +136,10 @@ module gpu_row_to_pixel(
                             px_valid <= 1'b0;        // row finished
                             state    <= ST_IDLE;
                         end else begin
-                            row   <= {1'b0, row[255:1]};
+                            // (the shift itself lives in u_sreg)
                             xcnt  <= xcnt + 8'd1;
                             px_x  <= xcnt + 8'd1;
-                            px_on <= row[1];         // next bit after shift
+                            px_on <= row_bit1;       // next bit after shift
                         end
                     end
                 end

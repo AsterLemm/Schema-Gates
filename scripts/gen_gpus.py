@@ -24,6 +24,12 @@ E(x,y) = A*x + B*y + C are SEEDED with multiplies once at commit, then
 stepped purely incrementally (E += A per pixel, row start += B per row).
 gpu_pipelined32 demonstrates the flagship CPU convention of external
 PIPELINE SYNCHRONIZER strobes (ppln_*) gating the per-class datapaths.
+
+MODULAR EMISSION (DigitalJS-style hierarchy): the per-slot coverage /
+hit / sign-test / edge-seed logic is emitted as LEAF MODULES instantiated
+once per slot (the classic repeated-unit look), and the painter-priority
+colour mux is its own unit. Scene stores and scan FSMs stay in each top;
+every expression is carried over verbatim, so behaviour is identical.
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -114,7 +120,40 @@ def gen_dot8():
         "MMIO scene store, double-buffered commit, racing-the-beam ROW-serial",
         "scanout (no framebuffer), screen_ready handshake, frame strobes.",
         "Scene: 4 point slots. Same bus + CONTROL bit map as src/GPUs/GPU.v.",
+        "MODULAR: 4 point-hit leaf decoders inside a row-composer unit.",
     ])
+    mods = f"""\
+// --- {name}_hit : one point slot's row decoder (leaf of {name}_rowcomp) ---
+// (operand isolation: the decoder only fires while its enable is high,
+//  so a disabled slot contributes constant zeros)
+module {name}_hit(
+    input  wire       en,
+    input  wire [2:0] x,
+    input  wire [2:0] y,
+    input  wire [2:0] cur_y,
+    output wire [7:0] hit
+);
+    assign hit = (en && y == cur_y) ? (8'd1 << x) : 8'd0;
+endmodule
+
+// --- {name}_rowcomp : OR of every active point on this row ---
+module {name}_rowcomp(
+    input  wire       a_en0, input wire [2:0] a_x0, input wire [2:0] a_y0,
+    input  wire       a_en1, input wire [2:0] a_x1, input wire [2:0] a_y1,
+    input  wire       a_en2, input wire [2:0] a_x2, input wire [2:0] a_y2,
+    input  wire       a_en3, input wire [2:0] a_x3, input wire [2:0] a_y3,
+    input  wire [2:0] cur_y,
+    input  wire       ctl_fill,
+    output wire [7:0] row_pix
+);
+    wire [7:0] hit0, hit1, hit2, hit3;
+    {name}_hit u_hit0(.en(a_en0), .x(a_x0), .y(a_y0), .cur_y(cur_y), .hit(hit0));
+    {name}_hit u_hit1(.en(a_en1), .x(a_x1), .y(a_y1), .cur_y(cur_y), .hit(hit1));
+    {name}_hit u_hit2(.en(a_en2), .x(a_x2), .y(a_y2), .cur_y(cur_y), .hit(hit2));
+    {name}_hit u_hit3(.en(a_en3), .x(a_x3), .y(a_y3), .cur_y(cur_y), .hit(hit3));
+    assign row_pix = ctl_fill ? 8'hFF : (hit0 | hit1 | hit2 | hit3);
+endmodule
+"""
     body = f"""//  {name}: 4 point slots on an 8x8 monochrome screen, row-serial scanout.
 //
 //  MMIO: gpu_we / gpu_addr[3:0] / gpu_wdata[31:0] -> writes, gpu_rdata reads
@@ -148,14 +187,17 @@ module {name} (
 
 {COMMIT_WIRE}
     // ---- row composer: OR of every active point on this row ---------------
-    // (operand isolation: a slot's decoder only fires while its enable is
-    //  high, so disabled slots contribute constant zeros)
+    // (one {name}_hit leaf per slot, see modules above)
     reg [2:0] cur_y;
-    wire [7:0] hit0 = (a_en[0] && a_y[0] == cur_y) ? (8'd1 << a_x[0]) : 8'd0;
-    wire [7:0] hit1 = (a_en[1] && a_y[1] == cur_y) ? (8'd1 << a_x[1]) : 8'd0;
-    wire [7:0] hit2 = (a_en[2] && a_y[2] == cur_y) ? (8'd1 << a_x[2]) : 8'd0;
-    wire [7:0] hit3 = (a_en[3] && a_y[3] == cur_y) ? (8'd1 << a_x[3]) : 8'd0;
-    wire [7:0] row_pix = ctl_fill ? 8'hFF : (hit0 | hit1 | hit2 | hit3);
+    wire [7:0] row_pix;
+    {name}_rowcomp u_rowcomp(
+        .a_en0(a_en[0]), .a_x0(a_x[0]), .a_y0(a_y[0]),
+        .a_en1(a_en[1]), .a_x1(a_x[1]), .a_y1(a_y[1]),
+        .a_en2(a_en[2]), .a_x2(a_x[2]), .a_y2(a_y[2]),
+        .a_en3(a_en[3]), .a_x3(a_x[3]), .a_y3(a_y[3]),
+        .cur_y(cur_y), .ctl_fill(ctl_fill),
+        .row_pix(row_pix)
+    );
 
     // ---- scan FSM ----------------------------------------------------------
     localparam S_IDLE = 2'd0, S_ROW = 2'd1, S_NEXT = 2'd2;
@@ -230,7 +272,7 @@ module {name} (
     end
 endmodule
 """
-    write(os.path.join(OUT, name + ".v"), hdr + "\n" + body)
+    write(os.path.join(OUT, name + ".v"), hdr + "\n" + mods + "\n" + body)
 
 
 # ===========================================================================
@@ -244,7 +286,46 @@ def gen_sprite16():
         "per-sprite 4-bit colour and free (x,y) placement. Pixel-serial",
         "racing-the-beam scanout with painter priority (higher slot wins).",
         "Double-buffered scene store; same bus + CONTROL map as GPU.v.",
+        "MODULAR: 4 sprite-coverage leaf units + a painter colour mux.",
     ])
+    mods = f"""\
+// --- {name}_cov : one sprite slot's coverage test ---
+// dx = sx - x : in-stamp when 0..7 ; same for dy. The position inputs
+// are operand-isolated: a disabled slot's subtractors see all zeros.
+module {name}_cov(
+    input  wire [3:0] sx,
+    input  wire [3:0] sy,
+    input  wire       en,
+    input  wire [3:0] x,
+    input  wire [3:0] y,
+    output wire       inhit,
+    output wire [2:0] dx,
+    output wire [2:0] dy
+);
+    wire [3:0] qx = sx & {{4{{en}}}};
+    wire [3:0] qy = sy & {{4{{en}}}};
+    wire [4:0] dx5 = {{1'b0,qx}} - {{1'b0,x}};
+    wire [4:0] dy5 = {{1'b0,qy}} - {{1'b0,y}};
+    assign inhit = en & ~dx5[4] & (dx5[3:0] < 4'd8) & ~dy5[4] & (dy5[3:0] < 4'd8);
+    assign dx = dx5[2:0];
+    assign dy = dy5[2:0];
+endmodule
+
+// --- {name}_colmux : painter priority colour mux (highest slot wins) ---
+module {name}_colmux(
+    input  wire       c0, input wire [3:0] col0,
+    input  wire       c1, input wire [3:0] col1,
+    input  wire       c2, input wire [3:0] col2,
+    input  wire       c3, input wire [3:0] col3,
+    input  wire       ctl_fill,
+    input  wire [3:0] fill_col,
+    output wire [3:0] pix_mux
+);
+    wire [3:0] scene_mux = c3 ? col3 : c2 ? col2
+                         : c1 ? col1 : c0 ? col0 : 4'd0;
+    assign pix_mux = ctl_fill ? fill_col : scene_mux;
+endmodule
+"""
     body = f"""//  {name}: 4 sprite slots (8x8 stamp, 1 bpp, 4-bit MUX colour) on 16x16.
 //
 //  MMIO: gpu_we / gpu_addr[3:0] / gpu_wdata[31:0] -> writes, gpu_rdata reads
@@ -289,32 +370,32 @@ module {name} (
     // ---- per-slot coverage at scan position (x,y) ---------------------------
     reg [3:0] sx, sy;          // scan position
 
-    // operand isolation: gate the position inputs of each comparator
-    //   dx = sx - a_x : in-stamp when 0..7 ; same for dy
-    wire [3:0] q0x = sx & {{4{{a_en[0]}}}};  wire [3:0] q0y = sy & {{4{{a_en[0]}}}};
-    wire [3:0] q1x = sx & {{4{{a_en[1]}}}};  wire [3:0] q1y = sy & {{4{{a_en[1]}}}};
-    wire [3:0] q2x = sx & {{4{{a_en[2]}}}};  wire [3:0] q2y = sy & {{4{{a_en[2]}}}};
-    wire [3:0] q3x = sx & {{4{{a_en[3]}}}};  wire [3:0] q3y = sy & {{4{{a_en[3]}}}};
+    // one {name}_cov leaf per slot (see modules above)
+    wire in0, in1, in2, in3;
+    wire [2:0] d0x, d0y, d1x, d1y, d2x, d2y, d3x, d3y;
+    {name}_cov u_cov0(.sx(sx), .sy(sy), .en(a_en[0]), .x(a_x[0]), .y(a_y[0]),
+                      .inhit(in0), .dx(d0x), .dy(d0y));
+    {name}_cov u_cov1(.sx(sx), .sy(sy), .en(a_en[1]), .x(a_x[1]), .y(a_y[1]),
+                      .inhit(in1), .dx(d1x), .dy(d1y));
+    {name}_cov u_cov2(.sx(sx), .sy(sy), .en(a_en[2]), .x(a_x[2]), .y(a_y[2]),
+                      .inhit(in2), .dx(d2x), .dy(d2y));
+    {name}_cov u_cov3(.sx(sx), .sy(sy), .en(a_en[3]), .x(a_x[3]), .y(a_y[3]),
+                      .inhit(in3), .dx(d3x), .dy(d3y));
 
-    wire [4:0] d0x = {{1'b0,q0x}} - {{1'b0,a_x[0]}};  wire [4:0] d0y = {{1'b0,q0y}} - {{1'b0,a_y[0]}};
-    wire [4:0] d1x = {{1'b0,q1x}} - {{1'b0,a_x[1]}};  wire [4:0] d1y = {{1'b0,q1y}} - {{1'b0,a_y[1]}};
-    wire [4:0] d2x = {{1'b0,q2x}} - {{1'b0,a_x[2]}};  wire [4:0] d2y = {{1'b0,q2y}} - {{1'b0,a_y[2]}};
-    wire [4:0] d3x = {{1'b0,q3x}} - {{1'b0,a_x[3]}};  wire [4:0] d3y = {{1'b0,q3y}} - {{1'b0,a_y[3]}};
+    // stamp bit lookup (the stamp store lives here, next to its writers)
+    wire c0 = in0 & a_stamp[{{2'd0, d0y}}][d0x];
+    wire c1 = in1 & a_stamp[{{2'd1, d1y}}][d1x];
+    wire c2 = in2 & a_stamp[{{2'd2, d2y}}][d2x];
+    wire c3 = in3 & a_stamp[{{2'd3, d3y}}][d3x];
 
-    wire in0 = a_en[0] & ~d0x[4] & (d0x[3:0] < 4'd8) & ~d0y[4] & (d0y[3:0] < 4'd8);
-    wire in1 = a_en[1] & ~d1x[4] & (d1x[3:0] < 4'd8) & ~d1y[4] & (d1y[3:0] < 4'd8);
-    wire in2 = a_en[2] & ~d2x[4] & (d2x[3:0] < 4'd8) & ~d2y[4] & (d2y[3:0] < 4'd8);
-    wire in3 = a_en[3] & ~d3x[4] & (d3x[3:0] < 4'd8) & ~d3y[4] & (d3y[3:0] < 4'd8);
-
-    wire c0 = in0 & a_stamp[{{2'd0, d0y[2:0]}}][d0x[2:0]];
-    wire c1 = in1 & a_stamp[{{2'd1, d1y[2:0]}}][d1x[2:0]];
-    wire c2 = in2 & a_stamp[{{2'd2, d2y[2:0]}}][d2x[2:0]];
-    wire c3 = in3 & a_stamp[{{2'd3, d3y[2:0]}}][d3x[2:0]];
-
-    // painter priority: highest slot wins
-    wire [3:0] scene_mux = c3 ? a_col[3] : c2 ? a_col[2]
-                         : c1 ? a_col[1] : c0 ? a_col[0] : 4'd0;
-    wire [3:0] pix_mux   = ctl_fill ? fill_col : scene_mux;
+    // painter priority: highest slot wins (see {name}_colmux above)
+    wire [3:0] pix_mux;
+    {name}_colmux u_colmux(
+        .c0(c0), .col0(a_col[0]), .c1(c1), .col1(a_col[1]),
+        .c2(c2), .col2(a_col[2]), .c3(c3), .col3(a_col[3]),
+        .ctl_fill(ctl_fill), .fill_col(fill_col),
+        .pix_mux(pix_mux)
+    );
 
     // ---- scan FSM ------------------------------------------------------------
     localparam S_IDLE = 2'd0, S_PIX = 2'd1, S_NEXT = 2'd2;
@@ -397,7 +478,7 @@ module {name} (
     end
 endmodule
 """
-    write(os.path.join(OUT, name + ".v"), hdr + "\n" + body)
+    write(os.path.join(OUT, name + ".v"), hdr + "\n" + mods + "\n" + body)
 
 
 # ===========================================================================
@@ -412,7 +493,69 @@ def gen_vector32():
         "beam scanout, painter priority (higher slot on top), double-",
         "buffered scene. Same bus + CONTROL bit map as the flagship GPU.v;",
         "RGB12 is nibble-expanded onto px_rgb[23:0] exactly like GPU.v.",
+        "MODULAR: 8 coverage leaf units + a painter colour mux unit.",
     ])
+    cov_insts = "\n".join(
+        f"    {name}_cov u_cov{g}(.sx(sx), .sy(sy), .en(a_en[{g}]), .ty(a_ty[{g}]),\n"
+        f"                       .x0(a_x0[{g}]), .y0(a_y0[{g}]),\n"
+        f"                       .x1(a_x1[{g}]), .y1(a_y1[{g}]), .cov(cov[{g}]));"
+        for g in range(8))
+    mods = f"""\
+// --- {name}_cov : one slot's coverage test (point/hline/vline/rect) ---
+// covered =
+//   point: x==x0 && y==y0
+//   hline: y==y0 && x0<=x<=x1
+//   vline: x==x0 && y0<=y<=y1
+//   rect : x0<=x<=x1 && y0<=y<=y1
+// operand isolation on the scan coordinates: parked slots hold zeros.
+module {name}_cov(
+    input  wire [4:0] sx,
+    input  wire [4:0] sy,
+    input  wire       en,
+    input  wire [1:0] ty,
+    input  wire [4:0] x0,
+    input  wire [4:0] y0,
+    input  wire [4:0] x1,
+    input  wire [4:0] y1,
+    output wire       cov
+);
+    wire [4:0] gx = sx & {{5{{en}}}};
+    wire [4:0] gy = sy & {{5{{en}}}};
+    wire xe = (gx == x0);
+    wire ye = (gy == y0);
+    wire xr = (gx >= x0) & (gx <= x1);
+    wire yr = (gy >= y0) & (gy <= y1);
+    assign cov = en & (
+          (ty == 2'd0) ? (xe & ye)
+        : (ty == 2'd1) ? (ye & xr)
+        : (ty == 2'd2) ? (xe & yr)
+        :                (xr & yr));
+endmodule
+
+// --- {name}_colmux : painter priority + fill + RGB12->RGB24 expand ---
+module {name}_colmux(
+    input  wire [7:0]  cov,
+    input  wire [11:0] col0, input wire [11:0] col1,
+    input  wire [11:0] col2, input wire [11:0] col3,
+    input  wire [11:0] col4, input wire [11:0] col5,
+    input  wire [11:0] col6, input wire [11:0] col7,
+    input  wire        ctl_fill,
+    input  wire [11:0] fill_col,
+    output wire [23:0] pix_rgb_w
+);
+    // painter priority: highest covering slot wins
+    wire [11:0] scene_col =
+          cov[7] ? col7 : cov[6] ? col6
+        : cov[5] ? col5 : cov[4] ? col4
+        : cov[3] ? col3 : cov[2] ? col2
+        : cov[1] ? col1 : cov[0] ? col0 : 12'd0;
+    wire [11:0] pix12 = ctl_fill ? fill_col : scene_col;
+    // RGB12 -> RGB24 nibble expansion (flagship convention)
+    assign pix_rgb_w = {{pix12[11:8], pix12[11:8],
+                        pix12[7:4],  pix12[7:4],
+                        pix12[3:0],  pix12[3:0]}};
+endmodule
+"""
     body = f"""//  {name}: 8 slots x {{point | hline | vline | rect}} on 32x32, RGB12.
 //
 //  MMIO: gpu_we / gpu_addr[3:0] / gpu_wdata[31:0] -> writes, gpu_rdata reads
@@ -457,40 +600,19 @@ module {name} (
 {COMMIT_WIRE}
     reg [4:0] sx, sy;          // scan position
 
-    // ---- per-slot coverage (generate-style, written out per slot) ----------
-    // covered(s) =
-    //   point: x==x0 && y==y0
-    //   hline: y==y0 && x0<=x<=x1
-    //   vline: x==x0 && y0<=y<=y1
-    //   rect : x0<=x<=x1 && y0<=y<=y1
+    // ---- per-slot coverage (one {name}_cov leaf per slot) ------------------
     wire [7:0] cov;
-    genvar g;
-    generate for (g = 0; g < 8; g = g + 1) begin : COV
-        // operand isolation on the scan coordinates
-        wire [4:0] gx = sx & {{5{{a_en[g]}}}};
-        wire [4:0] gy = sy & {{5{{a_en[g]}}}};
-        wire xe = (gx == a_x0[g]);
-        wire ye = (gy == a_y0[g]);
-        wire xr = (gx >= a_x0[g]) & (gx <= a_x1[g]);
-        wire yr = (gy >= a_y0[g]) & (gy <= a_y1[g]);
-        assign cov[g] = a_en[g] & (
-              (a_ty[g] == 2'd0) ? (xe & ye)
-            : (a_ty[g] == 2'd1) ? (ye & xr)
-            : (a_ty[g] == 2'd2) ? (xe & yr)
-            :                     (xr & yr));
-    end endgenerate
+{cov_insts}
 
-    // painter priority: highest covering slot wins
-    wire [11:0] scene_col =
-          cov[7] ? a_col[7] : cov[6] ? a_col[6]
-        : cov[5] ? a_col[5] : cov[4] ? a_col[4]
-        : cov[3] ? a_col[3] : cov[2] ? a_col[2]
-        : cov[1] ? a_col[1] : cov[0] ? a_col[0] : 12'd0;
-    wire [11:0] pix12 = ctl_fill ? fill_col : scene_col;
-    // RGB12 -> RGB24 nibble expansion (flagship convention)
-    wire [23:0] pix_rgb_w = {{pix12[11:8], pix12[11:8],
-                             pix12[7:4],  pix12[7:4],
-                             pix12[3:0],  pix12[3:0]}};
+    // painter priority + fill + nibble expansion (see {name}_colmux above)
+    wire [23:0] pix_rgb_w;
+    {name}_colmux u_colmux(
+        .cov(cov),
+        .col0(a_col[0]), .col1(a_col[1]), .col2(a_col[2]), .col3(a_col[3]),
+        .col4(a_col[4]), .col5(a_col[5]), .col6(a_col[6]), .col7(a_col[7]),
+        .ctl_fill(ctl_fill), .fill_col(fill_col),
+        .pix_rgb_w(pix_rgb_w)
+    );
 
     // ---- scan FSM -------------------------------------------------------------
     localparam S_IDLE = 2'd0, S_PIX = 2'd1, S_NEXT = 2'd2;
@@ -578,7 +700,7 @@ module {name} (
     end
 endmodule
 """
-    write(os.path.join(OUT, name + ".v"), hdr + "\n" + body)
+    write(os.path.join(OUT, name + ".v"), hdr + "\n" + mods + "\n" + body)
 
 
 # ===========================================================================
@@ -594,7 +716,69 @@ def gen_raster64():
         "steps them purely incrementally (E += A per pixel, +B per row) --",
         "the exact technique of the flagship GPU.v polygon path. Coverage =",
         "all three edge values share a sign. Row-serial 64-bit scanout.",
+        "MODULAR: per-slot sign-test leaves, an edge-seed unit, and a",
+        "seed-index decoder are drillable submodules.",
     ])
+    sgn_insts = "\n".join(
+        f"    {name}_sgn u_sgn{g}(.en(a_en[{g}]),\n"
+        f"                       .e0(e_cur[{g*3+0}]), .e1(e_cur[{g*3+1}]), .e2(e_cur[{g*3+2}]),\n"
+        f"                       .allp(allp[{g}]), .alln(alln[{g}]));"
+        for g in range(4))
+    mods = f"""\
+// --- {name}_sgn : one triangle slot's edge sign test ---
+// inside when E0,E1,E2 are all >= 0 or all <= 0 (winding-independent,
+// edge-inclusive). Disabled slots are operand-isolated by `en`.
+module {name}_sgn(
+    input  wire               en,
+    input  wire signed [15:0] e0,
+    input  wire signed [15:0] e1,
+    input  wire signed [15:0] e2,
+    output wire               allp,
+    output wire               alln
+);
+    wire s0 = e0[15];   // sign bits
+    wire s1 = e1[15];
+    wire s2 = e2[15];
+    wire z0 = (e0 == 16'sd0);
+    wire z1 = (e1 == 16'sd0);
+    wire z2 = (e2 == 16'sd0);
+    assign allp = en & (~s0 | z0) & (~s1 | z1) & (~s2 | z2);
+    assign alln = en & ( s0 | z0) & ( s1 | z1) & ( s2 | z2);
+endmodule
+
+// --- {name}_seed : edge coefficients for one edge (xk,yk)->(xn,yn) ---
+// A = dy, B = -dx, C = E(0,0) -- the ONLY multiplies in the design.
+module {name}_seed(
+    input  wire signed [15:0] xk,
+    input  wire signed [15:0] yk,
+    input  wire signed [15:0] xn,
+    input  wire signed [15:0] yn,
+    output wire signed [15:0] eA,
+    output wire signed [15:0] eB,
+    output wire signed [15:0] eC
+);
+    assign eA = yn - yk;                 // A =  dy
+    assign eB = xk - xn;                 // B = -dx
+    assign eC = yk * xn - xk * yn;       // C = E(0,0)
+endmodule
+
+// --- {name}_sdidx : which slot/vertex does edge seed_i belong to ---
+// edge seed_i joins vertex k of slot seed_i/3 to vertex (k+1) mod 3
+module {name}_sdidx(
+    input  wire [3:0] seed_i,
+    output wire [1:0] sd_slot,
+    output wire [1:0] sd_k,
+    output wire [1:0] sd_kn
+);
+    assign sd_slot = (seed_i >= 4'd9) ? 2'd3 :
+                     (seed_i >= 4'd6) ? 2'd2 :
+                     (seed_i >= 4'd3) ? 2'd1 : 2'd0;
+    assign sd_k    = (seed_i >= 4'd9) ? (seed_i - 4'd9)
+                   : (seed_i >= 4'd6) ? (seed_i - 4'd6)
+                   : (seed_i >= 4'd3) ? (seed_i - 4'd3) : seed_i;
+    assign sd_kn   = (sd_k == 2'd2) ? 2'd0 : (sd_k + 2'd1);
+endmodule
+"""
     body = f"""//  {name}: 4 triangle slots on a 64x64 monochrome screen.
 //
 //  MMIO: gpu_we / gpu_addr[3:0] / gpu_wdata[31:0] -> writes, gpu_rdata reads
@@ -641,20 +825,9 @@ module {name} (
     reg signed [15:0] e_row [0:11];
     reg signed [15:0] e_cur [0:11];
 
-    // ---- coverage at the current pixel (operand-isolated per slot) ---------
-    //  sign test only: no arithmetic on parked slots' values is performed.
+    // ---- coverage at the current pixel (one {name}_sgn leaf per slot) ------
     wire [3:0] allp, alln;
-    genvar g;
-    generate for (g = 0; g < 4; g = g + 1) begin : SGN
-        wire s0 = e_cur[g*3+0][15];   // sign bits
-        wire s1 = e_cur[g*3+1][15];
-        wire s2 = e_cur[g*3+2][15];
-        wire z0 = (e_cur[g*3+0] == 16'sd0);
-        wire z1 = (e_cur[g*3+1] == 16'sd0);
-        wire z2 = (e_cur[g*3+2] == 16'sd0);
-        assign allp[g] = a_en[g] & (~s0 | z0) & (~s1 | z1) & (~s2 | z2);
-        assign alln[g] = a_en[g] & ( s0 | z0) & ( s1 | z1) & ( s2 | z2);
-    end endgenerate
+{sgn_insts}
     wire covered = |(allp | alln);
     wire pix_on  = ctl_fill | covered;
 
@@ -671,19 +844,18 @@ module {name} (
     reg busy;
     integer i;
 
-    // seeding helpers: edge seed_i belongs to slot seed_i/3, joins vertex k
-    // to vertex (k+1) mod 3
-    wire [1:0] sd_slot = (seed_i >= 4'd9) ? 2'd3 :
-                         (seed_i >= 4'd6) ? 2'd2 :
-                         (seed_i >= 4'd3) ? 2'd1 : 2'd0;
-    wire [1:0] sd_k    = (seed_i >= 4'd9) ? (seed_i - 4'd9)
-                       : (seed_i >= 4'd6) ? (seed_i - 4'd6)
-                       : (seed_i >= 4'd3) ? (seed_i - 4'd3) : seed_i;
-    wire [1:0] sd_kn   = (sd_k == 2'd2) ? 2'd0 : (sd_k + 2'd1);
+    // seeding helpers: index decode + vertex fetch + coefficient math
+    // (edge seed_i belongs to slot seed_i/3, joins vertex k to (k+1) mod 3)
+    wire [1:0] sd_slot, sd_k, sd_kn;
+    {name}_sdidx u_sdidx(.seed_i(seed_i),
+                         .sd_slot(sd_slot), .sd_k(sd_k), .sd_kn(sd_kn));
     wire signed [15:0] xk = {{10'd0, a_vx[{{sd_slot, sd_k }}]}};
     wire signed [15:0] yk = {{10'd0, a_vy[{{sd_slot, sd_k }}]}};
     wire signed [15:0] xn = {{10'd0, a_vx[{{sd_slot, sd_kn}}]}};
     wire signed [15:0] yn = {{10'd0, a_vy[{{sd_slot, sd_kn}}]}};
+    wire signed [15:0] sd_eA, sd_eB, sd_eC;
+    {name}_seed u_seed(.xk(xk), .yk(yk), .xn(xn), .yn(yn),
+                       .eA(sd_eA), .eB(sd_eB), .eC(sd_eC));
 
     always @(posedge clk) begin
         if (reset) begin
@@ -735,11 +907,12 @@ module {name} (
             end
 
             // ---- seed pass: the only multiplies, one edge per cycle ---------
+            // (the coefficient math itself lives in u_seed above)
             S_SEED: begin
-                e_A  [seed_i] <= yn - yk;                 // A =  dy
-                e_B  [seed_i] <= xk - xn;                 // B = -dx
-                e_row[seed_i] <= yk * xn - xk * yn;       // C = E(0,0)
-                e_cur[seed_i] <= yk * xn - xk * yn;
+                e_A  [seed_i] <= sd_eA;                   // A =  dy
+                e_B  [seed_i] <= sd_eB;                   // B = -dx
+                e_row[seed_i] <= sd_eC;                   // C = E(0,0)
+                e_cur[seed_i] <= sd_eC;
                 if (seed_i == 4'd11) begin
                     cur_x <= 6'd0; cur_y <= 6'd0; rowbits <= 64'd0;
                     state <= S_PIX;
@@ -790,7 +963,7 @@ module {name} (
     end
 endmodule
 """
-    write(os.path.join(OUT, name + ".v"), hdr + "\n" + body)
+    write(os.path.join(OUT, name + ".v"), hdr + "\n" + mods + "\n" + body)
 
 
 # ===========================================================================
@@ -807,7 +980,74 @@ def gen_pipelined32():
         "ppln_line / ppln_rect -- drive high for normal run), the same",
         "convention as the flagship RV32IM_SYSTEM.v execution units.",
         "screen_ready back-pressure stalls the WHOLE pipe (single pipe_en).",
+        "MODULAR: 8 gated coverage leaf units + a painter colour mux.",
     ])
+    cov_insts = "\n".join(
+        f"    {name}_cov u_cov{g}(.sx(st1_x), .sy(st1_y),\n"
+        f"                       .en(a_en[{g}]), .ty(a_ty[{g}]),\n"
+        f"                       .x0(a_x0[{g}]), .y0(a_y0[{g}]),\n"
+        f"                       .x1(a_x1[{g}]), .y1(a_y1[{g}]),\n"
+        f"                       .ppln_point(ppln_point), .ppln_line(ppln_line),\n"
+        f"                       .ppln_rect(ppln_rect), .cov(cov_w[{g}]));"
+        for g in range(8))
+    mods = f"""\
+// --- {name}_cov : one slot's coverage test, class-gated by ppln_* ---
+// pipeline synchronizer gating: external strobe AND slot class. With a
+// strobe low that class's comparators see all-zero inputs and emit no
+// coverage; drive all three strobes high for normal operation.
+module {name}_cov(
+    input  wire [4:0] sx,
+    input  wire [4:0] sy,
+    input  wire       en,
+    input  wire [1:0] ty,
+    input  wire [4:0] x0,
+    input  wire [4:0] y0,
+    input  wire [4:0] x1,
+    input  wire [4:0] y1,
+    input  wire       ppln_point,
+    input  wire       ppln_line,
+    input  wire       ppln_rect,
+    output wire       cov
+);
+    wire is_pt = (ty == 2'd0);
+    wire is_ln = (ty == 2'd1) | (ty == 2'd2);
+    wire is_rc = (ty == 2'd3);
+    wire gate  = en & ( (is_pt & ppln_point)
+                      | (is_ln & ppln_line)
+                      | (is_rc & ppln_rect) );
+    // operand isolation: comparator inputs forced to zero when gated off
+    wire [4:0] gx = sx & {{5{{gate}}}};
+    wire [4:0] gy = sy & {{5{{gate}}}};
+    wire xe = (gx == x0);
+    wire ye = (gy == y0);
+    wire xr = (gx >= x0) & (gx <= x1);
+    wire yr = (gy >= y0) & (gy <= y1);
+    assign cov = gate & (
+          (ty == 2'd0) ? (xe & ye)
+        : (ty == 2'd1) ? (ye & xr)
+        : (ty == 2'd2) ? (xe & yr)
+        :                (xr & yr));
+endmodule
+
+// --- {name}_colmux : painter priority colour mux (STAGE 3 datapath) ---
+module {name}_colmux(
+    input  wire [7:0]  cov,
+    input  wire [23:0] col0, input wire [23:0] col1,
+    input  wire [23:0] col2, input wire [23:0] col3,
+    input  wire [23:0] col4, input wire [23:0] col5,
+    input  wire [23:0] col6, input wire [23:0] col7,
+    input  wire        ctl_fill,
+    input  wire [23:0] fill_col,
+    output wire [23:0] comp_rgb
+);
+    wire [23:0] comp_col =
+          cov[7] ? col7 : cov[6] ? col6
+        : cov[5] ? col5 : cov[4] ? col4
+        : cov[3] ? col3 : cov[2] ? col2
+        : cov[1] ? col1 : cov[0] ? col0 : 24'd0;
+    assign comp_rgb = ctl_fill ? fill_col : comp_col;
+endmodule
+"""
     body = f"""//  {name}: 8 slots x {{point | hline | vline | rect}} on 32x32, RGB24,
 //  rendered by a 3-stage pixel pipeline:
 //
@@ -883,6 +1123,7 @@ module {name} (
 
     // =========================================================================
     //  STAGE 2 -- EVAL: 8 coverage tests, class datapaths gated by ppln_*
+    //  (one {name}_cov leaf per slot, see modules above)
     // =========================================================================
     reg        st2_v;
     reg [4:0]  st2_x, st2_y;
@@ -890,38 +1131,20 @@ module {name} (
     reg        st2_first, st2_last;
 
     wire [7:0] cov_w;
-    genvar g;
-    generate for (g = 0; g < 8; g = g + 1) begin : COV
-        // pipeline synchronizer gating: external strobe AND slot class
-        wire is_pt = (a_ty[g] == 2'd0);
-        wire is_ln = (a_ty[g] == 2'd1) | (a_ty[g] == 2'd2);
-        wire is_rc = (a_ty[g] == 2'd3);
-        wire gate  = a_en[g] & ( (is_pt & ppln_point)
-                               | (is_ln & ppln_line)
-                               | (is_rc & ppln_rect) );
-        // operand isolation: comparator inputs forced to zero when gated off
-        wire [4:0] gx = st1_x & {{5{{gate}}}};
-        wire [4:0] gy = st1_y & {{5{{gate}}}};
-        wire xe = (gx == a_x0[g]);
-        wire ye = (gy == a_y0[g]);
-        wire xr = (gx >= a_x0[g]) & (gx <= a_x1[g]);
-        wire yr = (gy >= a_y0[g]) & (gy <= a_y1[g]);
-        assign cov_w[g] = gate & (
-              (a_ty[g] == 2'd0) ? (xe & ye)
-            : (a_ty[g] == 2'd1) ? (ye & xr)
-            : (a_ty[g] == 2'd2) ? (xe & yr)
-            :                     (xr & yr));
-    end endgenerate
+{cov_insts}
 
     // =========================================================================
     //  STAGE 3 -- COMPOSE: painter priority + output port (handshake here)
+    //  (the colour mux lives in {name}_colmux above)
     // =========================================================================
-    wire [23:0] comp_col =
-          st2_cov[7] ? a_col[7] : st2_cov[6] ? a_col[6]
-        : st2_cov[5] ? a_col[5] : st2_cov[4] ? a_col[4]
-        : st2_cov[3] ? a_col[3] : st2_cov[2] ? a_col[2]
-        : st2_cov[1] ? a_col[1] : st2_cov[0] ? a_col[0] : 24'd0;
-    wire [23:0] comp_rgb = ctl_fill ? fill_col : comp_col;
+    wire [23:0] comp_rgb;
+    {name}_colmux u_colmux(
+        .cov(st2_cov),
+        .col0(a_col[0]), .col1(a_col[1]), .col2(a_col[2]), .col3(a_col[3]),
+        .col4(a_col[4]), .col5(a_col[5]), .col6(a_col[6]), .col7(a_col[7]),
+        .ctl_fill(ctl_fill), .fill_col(fill_col),
+        .comp_rgb(comp_rgb)
+    );
 
     //  back-pressure: the output pixel may only leave when the screen is
     //  ready (or we're free-running); otherwise the WHOLE pipe freezes.
@@ -1031,7 +1254,7 @@ module {name} (
     end
 endmodule
 """
-    write(os.path.join(OUT, name + ".v"), hdr + "\n" + body)
+    write(os.path.join(OUT, name + ".v"), hdr + "\n" + mods + "\n" + body)
 
 
 gen_dot8()
@@ -1039,4 +1262,4 @@ gen_sprite16()
 gen_vector32()
 gen_raster64()
 gen_pipelined32()
-print("GPUs: dot8 / sprite16 / vector32 / raster64 / pipelined32 generated")
+print("GPUs: dot8 / sprite16 / vector32 / raster64 / pipelined32 generated (modular)")

@@ -6,6 +6,18 @@
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
 
+// --- bitonic_sort8_8_cmpasc : ascending compare-exchange (o1 = min, o2 = max) ---
+module bitonic_sort8_8_cmpasc(input [7:0] x, input [7:0] y, output [7:0] o1, output [7:0] o2);
+    assign o1 = (x < y) ? x : y;
+    assign o2 = (x < y) ? y : x;
+endmodule
+
+// --- bitonic_sort8_8_cmpdesc : descending compare-exchange (o1 = max, o2 = min) ---
+module bitonic_sort8_8_cmpdesc(input [7:0] x, input [7:0] y, output [7:0] o1, output [7:0] o2);
+    assign o1 = (x > y) ? x : y;
+    assign o2 = (x > y) ? y : x;
+endmodule
+
 module bitonic_sort8_8(input [7:0] in0, input [7:0] in1, input [7:0] in2, input [7:0] in3, input [7:0] in4, input [7:0] in5, input [7:0] in6, input [7:0] in7, output [7:0] out0, output [7:0] out1, output [7:0] out2, output [7:0] out3, output [7:0] out4, output [7:0] out5, output [7:0] out6, output [7:0] out7);
     // define out0 output 120.255.160
     wire [7:0] b0, b1;
@@ -32,54 +44,30 @@ module bitonic_sort8_8(input [7:0] in0, input [7:0] in1, input [7:0] in2, input 
     wire [7:0] b42, b43;
     wire [7:0] b44, b45;
     wire [7:0] b46, b47;
-    assign b0 = (in0 < in1) ? in0 : in1;
-    assign b1 = (in0 < in1) ? in1 : in0;
-    assign b2 = (in2 > in3) ? in2 : in3;
-    assign b3 = (in2 > in3) ? in3 : in2;
-    assign b4 = (b0 < b2) ? b0 : b2;
-    assign b5 = (b0 < b2) ? b2 : b0;
-    assign b6 = (b1 < b3) ? b1 : b3;
-    assign b7 = (b1 < b3) ? b3 : b1;
-    assign b8 = (b4 < b6) ? b4 : b6;
-    assign b9 = (b4 < b6) ? b6 : b4;
-    assign b10 = (b5 < b7) ? b5 : b7;
-    assign b11 = (b5 < b7) ? b7 : b5;
-    assign b12 = (in4 < in5) ? in4 : in5;
-    assign b13 = (in4 < in5) ? in5 : in4;
-    assign b14 = (in6 > in7) ? in6 : in7;
-    assign b15 = (in6 > in7) ? in7 : in6;
-    assign b16 = (b12 > b14) ? b12 : b14;
-    assign b17 = (b12 > b14) ? b14 : b12;
-    assign b18 = (b13 > b15) ? b13 : b15;
-    assign b19 = (b13 > b15) ? b15 : b13;
-    assign b20 = (b16 > b18) ? b16 : b18;
-    assign b21 = (b16 > b18) ? b18 : b16;
-    assign b22 = (b17 > b19) ? b17 : b19;
-    assign b23 = (b17 > b19) ? b19 : b17;
-    assign b24 = (b8 < b20) ? b8 : b20;
-    assign b25 = (b8 < b20) ? b20 : b8;
-    assign b26 = (b9 < b21) ? b9 : b21;
-    assign b27 = (b9 < b21) ? b21 : b9;
-    assign b28 = (b10 < b22) ? b10 : b22;
-    assign b29 = (b10 < b22) ? b22 : b10;
-    assign b30 = (b11 < b23) ? b11 : b23;
-    assign b31 = (b11 < b23) ? b23 : b11;
-    assign b32 = (b24 < b28) ? b24 : b28;
-    assign b33 = (b24 < b28) ? b28 : b24;
-    assign b34 = (b26 < b30) ? b26 : b30;
-    assign b35 = (b26 < b30) ? b30 : b26;
-    assign b36 = (b32 < b34) ? b32 : b34;
-    assign b37 = (b32 < b34) ? b34 : b32;
-    assign b38 = (b33 < b35) ? b33 : b35;
-    assign b39 = (b33 < b35) ? b35 : b33;
-    assign b40 = (b25 < b29) ? b25 : b29;
-    assign b41 = (b25 < b29) ? b29 : b25;
-    assign b42 = (b27 < b31) ? b27 : b31;
-    assign b43 = (b27 < b31) ? b31 : b27;
-    assign b44 = (b40 < b42) ? b40 : b42;
-    assign b45 = (b40 < b42) ? b42 : b40;
-    assign b46 = (b41 < b43) ? b41 : b43;
-    assign b47 = (b41 < b43) ? b43 : b41;
+    bitonic_sort8_8_cmpasc u_c0(.x(in0), .y(in1), .o1(b0), .o2(b1));
+    bitonic_sort8_8_cmpdesc u_c1(.x(in2), .y(in3), .o1(b2), .o2(b3));
+    bitonic_sort8_8_cmpasc u_c2(.x(b0), .y(b2), .o1(b4), .o2(b5));
+    bitonic_sort8_8_cmpasc u_c3(.x(b1), .y(b3), .o1(b6), .o2(b7));
+    bitonic_sort8_8_cmpasc u_c4(.x(b4), .y(b6), .o1(b8), .o2(b9));
+    bitonic_sort8_8_cmpasc u_c5(.x(b5), .y(b7), .o1(b10), .o2(b11));
+    bitonic_sort8_8_cmpasc u_c6(.x(in4), .y(in5), .o1(b12), .o2(b13));
+    bitonic_sort8_8_cmpdesc u_c7(.x(in6), .y(in7), .o1(b14), .o2(b15));
+    bitonic_sort8_8_cmpdesc u_c8(.x(b12), .y(b14), .o1(b16), .o2(b17));
+    bitonic_sort8_8_cmpdesc u_c9(.x(b13), .y(b15), .o1(b18), .o2(b19));
+    bitonic_sort8_8_cmpdesc u_c10(.x(b16), .y(b18), .o1(b20), .o2(b21));
+    bitonic_sort8_8_cmpdesc u_c11(.x(b17), .y(b19), .o1(b22), .o2(b23));
+    bitonic_sort8_8_cmpasc u_c12(.x(b8), .y(b20), .o1(b24), .o2(b25));
+    bitonic_sort8_8_cmpasc u_c13(.x(b9), .y(b21), .o1(b26), .o2(b27));
+    bitonic_sort8_8_cmpasc u_c14(.x(b10), .y(b22), .o1(b28), .o2(b29));
+    bitonic_sort8_8_cmpasc u_c15(.x(b11), .y(b23), .o1(b30), .o2(b31));
+    bitonic_sort8_8_cmpasc u_c16(.x(b24), .y(b28), .o1(b32), .o2(b33));
+    bitonic_sort8_8_cmpasc u_c17(.x(b26), .y(b30), .o1(b34), .o2(b35));
+    bitonic_sort8_8_cmpasc u_c18(.x(b32), .y(b34), .o1(b36), .o2(b37));
+    bitonic_sort8_8_cmpasc u_c19(.x(b33), .y(b35), .o1(b38), .o2(b39));
+    bitonic_sort8_8_cmpasc u_c20(.x(b25), .y(b29), .o1(b40), .o2(b41));
+    bitonic_sort8_8_cmpasc u_c21(.x(b27), .y(b31), .o1(b42), .o2(b43));
+    bitonic_sort8_8_cmpasc u_c22(.x(b40), .y(b42), .o1(b44), .o2(b45));
+    bitonic_sort8_8_cmpasc u_c23(.x(b41), .y(b43), .o1(b46), .o2(b47));
     assign out0 = b36;
     assign out1 = b37;
     assign out2 = b38;

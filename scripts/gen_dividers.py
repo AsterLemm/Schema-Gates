@@ -140,18 +140,24 @@ for w in WIDTHS:
              [f"{w}-bit {desc}; no / or % operator."])
     # reciprocal_seed: structural leading-one based seed (no division at all)
     sb=max(1,int(math.ceil(math.log2(w+1))))
-    L=[f"module reciprocal_seed{w}(input [{w-1}:0] a, output [{w-1}:0] seed);"]
-    L.append(f"    // define a input {COL['a']}   // define seed output {COL['out']}")
-    L.append(f"    // seed = 2^(W-1-msb(a)) : reflect leading-one position (priority logic)")
-    # priority encoder of MSB position -> one-hot reflected seed (structural OR/AND)
+    L=[f"// --- reciprocal_seed{w}_lead : leading-one detector (one-hot ms[k]) ---"]
+    L.append(f"module reciprocal_seed{w}_lead(input [{w-1}:0] a, output [{w-1}:0] ms);")
+    # priority encoder of MSB position -> one-hot (structural OR/AND)
     for k in range(w):
         higher=" | ".join(f"a[{j}]" for j in range(k+1,w)) if k<w-1 else "1'b0"
-        L.append(f"    wire ms{k} = a[{k}] & ~({higher});   // a[{k}] is the leading one")
+        L.append(f"    assign ms[{k}] = a[{k}] & ~({higher});   // a[{k}] is the leading one")
+    L.append("endmodule")
+    L.append("")
+    L.append(f"module reciprocal_seed{w}(input [{w-1}:0] a, output [{w-1}:0] seed);")
+    L.append(f"    // define a input {COL['a']}   // define seed output {COL['out']}")
+    L.append(f"    // seed = 2^(W-1-msb(a)) : reflect leading-one position (priority logic)")
+    L.append(f"    wire [{w-1}:0] ms;")
+    L.append(f"    reciprocal_seed{w}_lead u_lead(.a(a), .ms(ms));")
     seedbits=[]
     for pos in range(w):
         # seed bit 'pos' set when leading one at k = (w-1-pos)
         k=w-1-pos
-        seedbits.append(f"ms{k}")
+        seedbits.append(f"ms[{k}]")
     L.append(f"    assign seed = {{{', '.join(reversed(seedbits))}}};")
     L.append("endmodule")
     emit(f"reciprocal_seed{w}", "\n".join(L)+"\n",

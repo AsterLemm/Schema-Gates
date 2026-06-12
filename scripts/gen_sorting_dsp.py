@@ -29,39 +29,30 @@ for w in WIDTHS:
           f"    wire [{w-1}:0] mn = (a<b)?a:b;\n"
           f"    assign med = (c>mx)?mx : (c<mn)?mn : c;\nendmodule\n",[f"{w}-bit median-of-3."])
 
-# ---- sort4 / sort8 (sorting networks of compare_swap) ----------------
+# ---- sort4 / sort8 (sorting networks of compare-exchange cells) -------
 def sort_network(n, w):
-    """Batcher odd-even style network via behavioral compare-swap chain (named)."""
-    # use a known optimal network for small n
+    """Optimal small sorting network built from one compare-exchange leaf."""
     NETS={4:[(0,1),(2,3),(0,2),(1,3),(1,2)],
           8:[(0,1),(2,3),(4,5),(6,7),(0,2),(1,3),(4,6),(5,7),(1,2),(5,6),(0,4),(3,7),(1,5),(2,6),(1,4),(3,6),(2,4),(3,5),(3,4)]}
     net=NETS[n]
+    name=f"sort{n}_{w}"
     ins=", ".join(f"input [{w-1}:0] in{i}" for i in range(n))
     outs=", ".join(f"output [{w-1}:0] out{i}" for i in range(n))
-    L=[f"module sort{n}_{w}({ins}, {outs});"]
-    L.append(f"    // define out0 output {COL['out']}")
-    # use wire arrays for stages
-    L.append(f"    wire [{w-1}:0] s [0:{n-1}];")
-    for i in range(n):
-        L.append(f"    assign s[{i}] = in{i};")
-    # We need sequential reassignment; use a chain of intermediate arrays
-    cur=[f"in{i}" for i in range(n)]
-    stage=0
-    decl=[]
-    body=[]
+    L=[f"// --- {name}_cmpex : compare-exchange cell (lo = min, hi = max) ---"]
+    L.append(f"module {name}_cmpex(input [{w-1}:0] x, input [{w-1}:0] y, output [{w-1}:0] lo, output [{w-1}:0] hi);")
+    L.append(f"    assign lo = (x < y) ? x : y;")
+    L.append(f"    assign hi = (x < y) ? y : x;")
+    L.append("endmodule")
+    L.append("")
     arr=[f"in{i}" for i in range(n)]
-    # generate fresh wires per comparator output
-    namecount=0
-    def newwire():
-        nonlocal namecount
-        nm=f"w{namecount}"; namecount+=1; return nm
+    decl=[]; body=[]; namecount=0
     for (i,j) in net:
-        lo=newwire(); hi=newwire()
+        lo=f"w{namecount}"; hi=f"w{namecount+1}"
         decl.append(f"    wire [{w-1}:0] {lo}, {hi};")
-        body.append(f"    assign {lo} = ({arr[i]} < {arr[j]}) ? {arr[i]} : {arr[j]};")
-        body.append(f"    assign {hi} = ({arr[i]} < {arr[j]}) ? {arr[j]} : {arr[i]};")
+        body.append(f"    {name}_cmpex u_ce{namecount//2}(.x({arr[i]}), .y({arr[j]}), .lo({lo}), .hi({hi}));")
+        namecount+=2
         arr[i]=lo; arr[j]=hi
-    L=[f"module sort{n}_{w}({ins}, {outs});"]
+    L.append(f"module {name}({ins}, {outs});")
     L.append(f"    // define out0 output {COL['out']}")
     L += decl + body
     for i in range(n):
@@ -92,21 +83,31 @@ def bitonic(n, w):
             bitonic_sort(lo+k, k, 0)
             bitonic_merge(lo, cnt, direction)
     bitonic_sort(0, n, 1)
+    name=f"bitonic_sort{n}_{w}"
     ins=", ".join(f"input [{w-1}:0] in{i}" for i in range(n))
     outs=", ".join(f"output [{w-1}:0] out{i}" for i in range(n))
+    L=[f"// --- {name}_cmpasc : ascending compare-exchange (o1 = min, o2 = max) ---"]
+    L.append(f"module {name}_cmpasc(input [{w-1}:0] x, input [{w-1}:0] y, output [{w-1}:0] o1, output [{w-1}:0] o2);")
+    L.append(f"    assign o1 = (x < y) ? x : y;")
+    L.append(f"    assign o2 = (x < y) ? y : x;")
+    L.append("endmodule")
+    L.append("")
+    L.append(f"// --- {name}_cmpdesc : descending compare-exchange (o1 = max, o2 = min) ---")
+    L.append(f"module {name}_cmpdesc(input [{w-1}:0] x, input [{w-1}:0] y, output [{w-1}:0] o1, output [{w-1}:0] o2);")
+    L.append(f"    assign o1 = (x > y) ? x : y;")
+    L.append(f"    assign o2 = (x > y) ? y : x;")
+    L.append("endmodule")
+    L.append("")
     arr=[f"in{i}" for i in range(n)]
     decl=[]; body=[]; nc=0
     for (i,j,d) in comparators:
-        a=f"b{nc}"; b=f"b{nc+1}"; nc+=2
+        a=f"b{nc}"; b=f"b{nc+1}"
         decl.append(f"    wire [{w-1}:0] {a}, {b};")
-        if d==1: # ascending: lo->i, hi->j
-            body.append(f"    assign {a} = ({arr[i]} < {arr[j]}) ? {arr[i]} : {arr[j]};")
-            body.append(f"    assign {b} = ({arr[i]} < {arr[j]}) ? {arr[j]} : {arr[i]};")
-        else:
-            body.append(f"    assign {a} = ({arr[i]} > {arr[j]}) ? {arr[i]} : {arr[j]};")
-            body.append(f"    assign {b} = ({arr[i]} > {arr[j]}) ? {arr[j]} : {arr[i]};")
+        cell = "cmpasc" if d==1 else "cmpdesc"
+        body.append(f"    {name}_{cell} u_c{nc//2}(.x({arr[i]}), .y({arr[j]}), .o1({a}), .o2({b}));")
+        nc+=2
         arr[i]=a; arr[j]=b
-    L=[f"module bitonic_sort{n}_{w}({ins}, {outs});"]
+    L.append(f"module {name}({ins}, {outs});")
     L.append(f"    // define out0 output {COL['out']}")
     L += decl + body
     for i in range(n):

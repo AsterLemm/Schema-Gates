@@ -27,10 +27,34 @@
 //      gpu_scene_player -> GPU bus;  gpu_frame_pacer -> GPU.screen_ready
 //      GPU.px_* -> gpu_frame_crc32 (signatures) or a display shifter.
 //
+//  MODULAR: the embedded command script is a drillable ROM unit.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
+
+// --- gpu_scene_player_rom : the embedded command sequence ---
+// 10-bit signed vertex fields: -20 = 10'h3EC, -12 = 10'h3F4,
+// 20 = 10'h014, 18 = 10'h012 ; VERT packs {2'b0, z[9:0], y[9:0], x[9:0]}
+module gpu_scene_player_rom(
+    input  wire [3:0]  pcnt,
+    output reg  [35:0] script        // {addr[3:0], wdata[31:0]}
+);
+    always @(*) begin
+        case (pcnt)
+            4'd0: script = {4'd0, 32'h00021F1F};  // CONFIG: RGB12 32x32 ortho
+            4'd1: script = {4'd1, 32'h00000009};  // CONTROL: wait | enable
+            4'd2: script = {4'd4, 32'h00000000};  // SEL: slot 0, vert 0
+            4'd3: script = {4'd5, 32'h0000007E};  // PRIMHDR: 3,en,fill,3d,poly
+            4'd4: script = {4'd6, 32'h00000F80};  // PRIMCOL: amber (RGB12)
+            4'd5: script = {4'd7, {2'b00, 10'h000, 10'h3F4, 10'h3EC}}; // V0
+            4'd6: script = {4'd7, {2'b00, 10'h000, 10'h3F4, 10'h014}}; // V1
+            4'd7: script = {4'd7, {2'b00, 10'h000, 10'h012, 10'h000}}; // V2
+            4'd8: script = {4'd1, 32'h00000019};  // CONTROL: commit|wait|en
+            default: script = 36'd0;
+        endcase
+    end
+endmodule
 
 module gpu_scene_player(
     input  wire        clk,
@@ -60,22 +84,10 @@ module gpu_scene_player(
     //  10-bit signed vertex fields: -20 = 10'h3EC, -12 = 10'h3F4,
     //  20 = 10'h014, 18 = 10'h012 ; VERT packs {2'b0, z[9:0], y[9:0], x[9:0]}
     localparam [3:0]  N_INIT = 4'd9;
-    reg [35:0] script;                 // {addr[3:0], wdata[31:0]}
     reg [3:0]  pcnt;
-    always @(*) begin
-        case (pcnt)
-            4'd0: script = {4'd0, 32'h00021F1F};  // CONFIG: RGB12 32x32 ortho
-            4'd1: script = {4'd1, 32'h00000009};  // CONTROL: wait | enable
-            4'd2: script = {4'd4, 32'h00000000};  // SEL: slot 0, vert 0
-            4'd3: script = {4'd5, 32'h0000007E};  // PRIMHDR: 3,en,fill,3d,poly
-            4'd4: script = {4'd6, 32'h00000F80};  // PRIMCOL: amber (RGB12)
-            4'd5: script = {4'd7, {2'b00, 10'h000, 10'h3F4, 10'h3EC}}; // V0
-            4'd6: script = {4'd7, {2'b00, 10'h000, 10'h3F4, 10'h014}}; // V1
-            4'd7: script = {4'd7, {2'b00, 10'h000, 10'h012, 10'h000}}; // V2
-            4'd8: script = {4'd1, 32'h00000019};  // CONTROL: commit|wait|en
-            default: script = 36'd0;
-        endcase
-    end
+    // the script lives in gpu_scene_player_rom above (same contents)
+    wire [35:0] script;                // {addr[3:0], wdata[31:0]}
+    gpu_scene_player_rom u_rom(.pcnt(pcnt), .script(script));
 
     // ---- player FSM ------------------------------------------------------
     localparam ST_INIT   = 2'd0;   // stream the script, one write per clock

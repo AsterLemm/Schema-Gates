@@ -17,13 +17,19 @@ def with_defs(body, top, defs):
             out.append(defs.rstrip("\n"))
     return "\n".join(out)
 
-# ---- partial_products: structural AND matrix (already structural) -----
+# ---- partial_products: structural AND matrix (row-modular) ------------
 def partial_products(w):
-    L=[f"module partial_products{w}(input [{w-1}:0] a, input [{w-1}:0] b, output [{w*w-1}:0] pp);"]
+    L=[f"// --- partial_products{w}_row : one rank of the AND matrix (one b bit) ---"]
+    L.append(f"module partial_products{w}_row(input [{w-1}:0] a, input bbit, output [{w-1}:0] ppr);")
+    for j in range(w):
+        L.append(f"    assign ppr[{j}] = a[{j}] & bbit;")
+    L.append("endmodule")
+    L.append("")
+    L.append(f"module partial_products{w}(input [{w-1}:0] a, input [{w-1}:0] b, output [{w*w-1}:0] pp);")
     L.append(f"    // define a input {COL['a']}   // define b input {COL['b']}   // define pp output {COL['out']}")
+    L.append(f"    // one row instance per b bit: pp[i*{w}+j] = a[j] & b[i], as before")
     for i in range(w):
-        for j in range(w):
-            L.append(f"    assign pp[{i*w+j}] = a[{j}] & b[{i}];")
+        L.append(f"    partial_products{w}_row u_row{i}(.a(a), .bbit(b[{i}]), .ppr(pp[{(i+1)*w-1}:{i*w}]));")
     L.append("endmodule")
     return "\n".join(L)+"\n"
 for w in WIDTHS:

@@ -6,6 +6,12 @@
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
 
+// --- sort4_4_cmpex : compare-exchange cell (lo = min, hi = max) ---
+module sort4_4_cmpex(input [3:0] x, input [3:0] y, output [3:0] lo, output [3:0] hi);
+    assign lo = (x < y) ? x : y;
+    assign hi = (x < y) ? y : x;
+endmodule
+
 module sort4_4(input [3:0] in0, input [3:0] in1, input [3:0] in2, input [3:0] in3, output [3:0] out0, output [3:0] out1, output [3:0] out2, output [3:0] out3);
     // define out0 output 120.255.160
     wire [3:0] w0, w1;
@@ -13,16 +19,11 @@ module sort4_4(input [3:0] in0, input [3:0] in1, input [3:0] in2, input [3:0] in
     wire [3:0] w4, w5;
     wire [3:0] w6, w7;
     wire [3:0] w8, w9;
-    assign w0 = (in0 < in1) ? in0 : in1;
-    assign w1 = (in0 < in1) ? in1 : in0;
-    assign w2 = (in2 < in3) ? in2 : in3;
-    assign w3 = (in2 < in3) ? in3 : in2;
-    assign w4 = (w0 < w2) ? w0 : w2;
-    assign w5 = (w0 < w2) ? w2 : w0;
-    assign w6 = (w1 < w3) ? w1 : w3;
-    assign w7 = (w1 < w3) ? w3 : w1;
-    assign w8 = (w6 < w5) ? w6 : w5;
-    assign w9 = (w6 < w5) ? w5 : w6;
+    sort4_4_cmpex u_ce0(.x(in0), .y(in1), .lo(w0), .hi(w1));
+    sort4_4_cmpex u_ce1(.x(in2), .y(in3), .lo(w2), .hi(w3));
+    sort4_4_cmpex u_ce2(.x(w0), .y(w2), .lo(w4), .hi(w5));
+    sort4_4_cmpex u_ce3(.x(w1), .y(w3), .lo(w6), .hi(w7));
+    sort4_4_cmpex u_ce4(.x(w6), .y(w5), .lo(w8), .hi(w9));
     assign out0 = w4;
     assign out1 = w8;
     assign out2 = w9;

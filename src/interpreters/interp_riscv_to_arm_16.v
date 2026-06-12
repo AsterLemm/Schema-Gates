@@ -40,43 +40,80 @@
 //    * I-type immediates outside 0..255 (except negative ADDI, which
 //      becomes SUB), and LW/SW/JALR offsets outside 0..255
 //
+//  MODULAR: guest-field decode + the translate cloud are drillable.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
 
-module interp_riscv_to_arm_16(
-    // host fetch side: connect to cpu_arm16 imem_addr / imem_data
-    input  wire [7:0]  host_addr,
-    output reg  [31:0] host_instr,
-    // guest program side: connect to the guest binary ROM (32 x 32-bit)
-    output wire [4:0]  guest_addr,
+// --- interp_riscv_to_arm_16_gdec : guest field extraction + class decode ---
+// (verbatim from the monolithic body; wire = -> assign =)
+module interp_riscv_to_arm_16_gdec(
     input  wire [31:0] guest_instr,
-    // high while feeding HALT for an untranslatable guest instruction
+    output wire [3:0] gop,
+    output wire [3:0] rd,
+    output wire [3:0] rs1,
+    output wire [3:0] rs2,
+    output wire [15:0] imm16,
+    output wire [3:0] funct,
+    output wire [7:0] immlo,
+    output wire immneg,
+    output wire [15:0] immabs,
+    output wire imm_ok,
+    output wire nimm_ok
+);
+    // ---- guest field extraction (RV-lite encoding) -----------------------
+    assign gop = guest_instr[31:28];
+    assign rd = guest_instr[27:24];
+    assign rs1 = guest_instr[23:20];
+    assign rs2 = guest_instr[19:16];
+    assign imm16 = guest_instr[15:0];
+    assign funct = guest_instr[3:0];
+    assign immlo = imm16[7:0];
+    assign immneg = imm16[15];
+    assign immabs = (~imm16) + 16'd1;        // |imm| for negative ADDI
+    assign imm_ok = (imm16[15:8] == 8'd0);
+    assign nimm_ok = immneg && (immabs[15:8] == 8'd0);
+
+endmodule
+
+// --- interp_riscv_to_arm_16_xlat : the bundle translator (guest -> host words) ---
+// the entire translate cloud of the old monolithic body, carried
+// over verbatim; guest fields come from interp_riscv_to_arm_16_gdec inside.
+module interp_riscv_to_arm_16_xlat(
+    input  wire [7:0]  host_addr,
+    input  wire [4:0]  gpc,
+    input  wire [2:0]  slot,
+    input  wire [31:0] guest_instr,
+    output reg  [31:0] host_instr,
     output reg         trap
 );
-    // define host_addr    input  255.190.70
-    // define host_instr   output 120.200.255
-    // define guest_addr   output 255.140.60
-    // define guest_instr  input  68.68.242
-    // define trap         output 255.80.80
+    wire [3:0] gop;
+    wire [3:0] rd;
+    wire [3:0] rs1;
+    wire [3:0] rs2;
+    wire [15:0] imm16;
+    wire [3:0] funct;
+    wire [7:0] immlo;
+    wire immneg;
+    wire [15:0] immabs;
+    wire imm_ok;
+    wire nimm_ok;
 
-    wire [4:0] gpc  = host_addr[7:3];
-    wire [2:0] slot = host_addr[2:0];
-    assign guest_addr = gpc;
-
-    // ---- guest field extraction (RV-lite encoding) -----------------------
-    wire [3:0]  gop   = guest_instr[31:28];
-    wire [3:0]  rd    = guest_instr[27:24];
-    wire [3:0]  rs1   = guest_instr[23:20];
-    wire [3:0]  rs2   = guest_instr[19:16];
-    wire [15:0] imm16 = guest_instr[15:0];
-    wire [3:0]  funct = guest_instr[3:0];
-    wire [7:0]  immlo = imm16[7:0];
-    wire        immneg = imm16[15];
-    wire [15:0] immabs = (~imm16) + 16'd1;        // |imm| for negative ADDI
-    wire        imm_ok  = (imm16[15:8] == 8'd0);
-    wire        nimm_ok = immneg && (immabs[15:8] == 8'd0);
+    interp_riscv_to_arm_16_gdec u_gdec(
+        .guest_instr(guest_instr),
+        .gop(gop),
+        .rd(rd),
+        .rs1(rs1),
+        .rs2(rs2),
+        .imm16(imm16),
+        .funct(funct),
+        .immlo(immlo),
+        .immneg(immneg),
+        .immabs(immabs),
+        .imm_ok(imm_ok),
+        .nimm_ok(nimm_ok)
+    );
 
     // ---- host word builders (cpu_arm16 encoding) -------------------------
     localparam [3:0] AL = 4'd14;
@@ -199,4 +236,30 @@ module interp_riscv_to_arm_16(
     end
 endmodule
 
+module interp_riscv_to_arm_16(
+    // host fetch side: connect to cpu_arm16 imem_addr / imem_data
+    input  wire [7:0]  host_addr,
+    output wire [31:0] host_instr,
+    // guest program side: connect to the guest binary ROM (32 x 32-bit)
+    output wire [4:0]  guest_addr,
+    input  wire [31:0] guest_instr,
+    // high while feeding HALT for an untranslatable guest instruction
+    output wire        trap
+);
+    // define host_addr    input  255.190.70
+    // define host_instr   output 120.200.255
+    // define guest_addr   output 255.140.60
+    // define guest_instr  input  68.68.242
+    // define trap         output 255.80.80
 
+    wire [4:0] gpc  = host_addr[7:3];
+    wire [2:0] slot = host_addr[2:0];
+    assign guest_addr = gpc;
+
+    // the entire translator lives in interp_riscv_to_arm_16_xlat above
+    interp_riscv_to_arm_16_xlat u_xlat(
+        .host_addr(host_addr), .gpc(gpc), .slot(slot),
+        .guest_instr(guest_instr),
+        .host_instr(host_instr), .trap(trap)
+    );
+endmodule

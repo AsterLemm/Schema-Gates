@@ -5,10 +5,42 @@
 //  MMIO scene store, double-buffered commit, racing-the-beam ROW-serial
 //  scanout (no framebuffer), screen_ready handshake, frame strobes.
 //  Scene: 4 point slots. Same bus + CONTROL bit map as src/GPUs/GPU.v.
+//  MODULAR: 4 point-hit leaf decoders inside a row-composer unit.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
+
+// --- gpu_dot8_hit : one point slot's row decoder (leaf of gpu_dot8_rowcomp) ---
+// (operand isolation: the decoder only fires while its enable is high,
+//  so a disabled slot contributes constant zeros)
+module gpu_dot8_hit(
+    input  wire       en,
+    input  wire [2:0] x,
+    input  wire [2:0] y,
+    input  wire [2:0] cur_y,
+    output wire [7:0] hit
+);
+    assign hit = (en && y == cur_y) ? (8'd1 << x) : 8'd0;
+endmodule
+
+// --- gpu_dot8_rowcomp : OR of every active point on this row ---
+module gpu_dot8_rowcomp(
+    input  wire       a_en0, input wire [2:0] a_x0, input wire [2:0] a_y0,
+    input  wire       a_en1, input wire [2:0] a_x1, input wire [2:0] a_y1,
+    input  wire       a_en2, input wire [2:0] a_x2, input wire [2:0] a_y2,
+    input  wire       a_en3, input wire [2:0] a_x3, input wire [2:0] a_y3,
+    input  wire [2:0] cur_y,
+    input  wire       ctl_fill,
+    output wire [7:0] row_pix
+);
+    wire [7:0] hit0, hit1, hit2, hit3;
+    gpu_dot8_hit u_hit0(.en(a_en0), .x(a_x0), .y(a_y0), .cur_y(cur_y), .hit(hit0));
+    gpu_dot8_hit u_hit1(.en(a_en1), .x(a_x1), .y(a_y1), .cur_y(cur_y), .hit(hit1));
+    gpu_dot8_hit u_hit2(.en(a_en2), .x(a_x2), .y(a_y2), .cur_y(cur_y), .hit(hit2));
+    gpu_dot8_hit u_hit3(.en(a_en3), .x(a_x3), .y(a_y3), .cur_y(cur_y), .hit(hit3));
+    assign row_pix = ctl_fill ? 8'hFF : (hit0 | hit1 | hit2 | hit3);
+endmodule
 
 //  gpu_dot8: 4 point slots on an 8x8 monochrome screen, row-serial scanout.
 //
@@ -73,14 +105,17 @@ module gpu_dot8 (
     wire commit_strobe = gpu_we && (gpu_addr == 4'd1) && gpu_wdata[4];
 
     // ---- row composer: OR of every active point on this row ---------------
-    // (operand isolation: a slot's decoder only fires while its enable is
-    //  high, so disabled slots contribute constant zeros)
+    // (one gpu_dot8_hit leaf per slot, see modules above)
     reg [2:0] cur_y;
-    wire [7:0] hit0 = (a_en[0] && a_y[0] == cur_y) ? (8'd1 << a_x[0]) : 8'd0;
-    wire [7:0] hit1 = (a_en[1] && a_y[1] == cur_y) ? (8'd1 << a_x[1]) : 8'd0;
-    wire [7:0] hit2 = (a_en[2] && a_y[2] == cur_y) ? (8'd1 << a_x[2]) : 8'd0;
-    wire [7:0] hit3 = (a_en[3] && a_y[3] == cur_y) ? (8'd1 << a_x[3]) : 8'd0;
-    wire [7:0] row_pix = ctl_fill ? 8'hFF : (hit0 | hit1 | hit2 | hit3);
+    wire [7:0] row_pix;
+    gpu_dot8_rowcomp u_rowcomp(
+        .a_en0(a_en[0]), .a_x0(a_x[0]), .a_y0(a_y[0]),
+        .a_en1(a_en[1]), .a_x1(a_x[1]), .a_y1(a_y[1]),
+        .a_en2(a_en[2]), .a_x2(a_x[2]), .a_y2(a_y[2]),
+        .a_en3(a_en[3]), .a_x3(a_x[3]), .a_y3(a_y[3]),
+        .cur_y(cur_y), .ctl_fill(ctl_fill),
+        .row_pix(row_pix)
+    );
 
     // ---- scan FSM ----------------------------------------------------------
     localparam S_IDLE = 2'd0, S_ROW = 2'd1, S_NEXT = 2'd2;

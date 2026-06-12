@@ -54,32 +54,19 @@
 //
 //  trap is tied low: every guest opcode translates (full ISA coverage).
 //
+//  MODULAR: guest-field decode + the translate cloud are drillable.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
 
-module interp_vonneumann_to_x86_16(
-    // host fetch side: connect to cpu_x86_16 imem_addr / imem_data
-    input  wire [7:0]  host_addr,
-    output reg  [15:0] host_instr,
-    // guest program side: connect to the guest binary ROM (16x16)
-    output wire [3:0]  guest_addr,
+// --- interp_vonneumann_to_x86_16_xlat : the bundle translator (guest -> host words) ---
+// the entire translate cloud of the old monolithic body, verbatim.
+module interp_vonneumann_to_x86_16_xlat(
+    input  wire        slot,
     input  wire [15:0] guest_instr,
-    // high while feeding HLT for an untranslatable guest op (never here)
-    output wire        trap
+    output reg  [15:0] host_instr
 );
-    // define host_addr    input  255.190.70
-    // define host_instr   output 120.200.255
-    // define guest_addr   output 255.140.60
-    // define guest_instr  input  68.68.242
-    // define trap         output 255.80.80
-
-    wire [3:0] gpc  = host_addr[4:1];
-    wire       slot = host_addr[0];
-    assign guest_addr = gpc;
-    assign trap = 1'b0;
-
     wire [3:0] gop = guest_instr[15:12];
     wire [3:0] m   = guest_instr[3:0];
 
@@ -120,4 +107,30 @@ module interp_vonneumann_to_x86_16(
     end
 endmodule
 
+module interp_vonneumann_to_x86_16(
+    // host fetch side: connect to cpu_x86_16 imem_addr / imem_data
+    input  wire [7:0]  host_addr,
+    output wire [15:0] host_instr,
+    // guest program side: connect to the guest binary ROM (16x16)
+    output wire [3:0]  guest_addr,
+    input  wire [15:0] guest_instr,
+    // high while feeding HLT for an untranslatable guest op (never here)
+    output wire        trap
+);
+    // define host_addr    input  255.190.70
+    // define host_instr   output 120.200.255
+    // define guest_addr   output 255.140.60
+    // define guest_instr  input  68.68.242
+    // define trap         output 255.80.80
 
+    wire [3:0] gpc  = host_addr[4:1];
+    wire       slot = host_addr[0];
+    assign guest_addr = gpc;
+    assign trap = 1'b0;
+
+    // the entire translator lives in interp_vonneumann_to_x86_16_xlat above
+    interp_vonneumann_to_x86_16_xlat u_xlat(
+        .slot(slot), .guest_instr(guest_instr),
+        .host_instr(host_instr)
+    );
+endmodule

@@ -62,39 +62,25 @@ for fam in BUILDERS:
 # pseudo-carries serially-in-structure but keep it gate-level & verified.
 def emit_ling(w):
     name=f"add_ling{w}"
-    L=[f"module {name}(input [{w-1}:0] a, input [{w-1}:0] b, input cin, output [{w-1}:0] sum, output cout);"]
-    L.append(DEF.rstrip("\n"))
-    L.append(f"    wire [{w-1}:0] p, g, t;")
-    for i in range(w):
-        L.append(f"    assign p[{i}] = a[{i}] ^ b[{i}];")
-        L.append(f"    assign g[{i}] = a[{i}] & b[{i}];")
-        L.append(f"    assign t[{i}] = a[{i}] | b[{i}];   // Ling transmit")
-    # Ling pseudo-carry H: H[0] = g[0] | cin ; H[i] = g[i] | (t[i-1] & H[i-1])
-    L.append(f"    wire [{w-1}:0] H;")
-    L.append(f"    assign H[0] = g[0] | cin;")
-    for i in range(1,w):
-        L.append(f"    assign H[{i}] = g[{i}] | (t[{i-1}] & H[{i-1}]);")
-    # real carry into bit i: c[i] = H[i-1] (with c[0]=cin); sum[i]=p[i]^c[i]
-    L.append(f"    assign sum[0] = p[0] ^ cin;")
-    for i in range(1,w):
-        L.append(f"    assign sum[{i}] = p[{i}] ^ ( (i==0) ? cin : 1'b0 ) ^ (t[{i-1}] & H[{i-1}]) ^ (g[{i-1}] ? 1'b0:1'b0);".replace("(i==0)","1'b0").replace("? cin","? cin"))
-    # The above is messy; replace with clean correct carry: c[i]=g[i-1]|(t[i-1]&...)
-    L=[x for x in L if "messy" not in x]
-    L2=[f"module {name}(input [{w-1}:0] a, input [{w-1}:0] b, input cin, output [{w-1}:0] sum, output cout);"]
+    L2=[f"// --- {name}_cell : one Ling bit cell (p/g/t + sum + carry-out) ---"]
+    L2.append(f"module {name}_cell(input ai, input bi, input ci, output si, output co);")
+    L2.append("    wire p = ai ^ bi;")
+    L2.append("    wire g = ai & bi;")
+    L2.append("    wire t = ai | bi;   // Ling transmit")
+    L2.append("    assign co = g | (t & ci);")
+    L2.append("    assign si = p ^ ci;")
+    L2.append("endmodule")
+    L2.append("")
+    L2.append(f"module {name}(input [{w-1}:0] a, input [{w-1}:0] b, input cin, output [{w-1}:0] sum, output cout);")
     L2.append(DEF.rstrip("\n"))
-    L2.append(f"    wire [{w-1}:0] p, g, t;")
-    for i in range(w):
-        L2.append(f"    assign p[{i}] = a[{i}] ^ b[{i}];")
-        L2.append(f"    assign g[{i}] = a[{i}] & b[{i}];")
-        L2.append(f"    assign t[{i}] = a[{i}] | b[{i}];")
+    L2.append(f"    // {w} chained Ling bit cells (same per-bit equations as before)")
     L2.append(f"    wire [{w}:0] c; assign c[0]=cin;")
     for i in range(w):
-        L2.append(f"    assign c[{i+1}] = g[{i}] | (t[{i}] & c[{i}]);")
-    for i in range(w):
-        L2.append(f"    assign sum[{i}] = p[{i}] ^ c[{i}];")
+        L2.append(f"    {name}_cell u_bit{i}(.ai(a[{i}]), .bi(b[{i}]), .ci(c[{i}]), .si(sum[{i}]), .co(c[{i+1}]));")
     L2.append(f"    assign cout = c[{w}];")
     L2.append("endmodule")
-    emit(name,"\n".join(L2)+"\n",[f"{w}-bit Ling-style adder (transmit t=a|b, carry recurrence)."])
+    emit(name,"\n".join(L2)+"\n",[f"{w}-bit Ling-style adder (transmit t=a|b, carry recurrence).",
+         "MODULAR: one chained bit cell per bit (drillable repeated unit)."])
 for w in WIDTHS: emit_ling(w)
 
 print("prefix + ling adders generated")

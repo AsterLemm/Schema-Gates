@@ -1209,15 +1209,10 @@ module ALU (
     wire [31:0] write_data_back = mem_to_reg ? mem_read_data : alu_result;
 
     // Synchronous write, never write to x0
-    // BITF memfix (v4.12.1 companion): this write used to sit in an
-    // `always @(posedge clk or posedge reset)` block.  An async-reset
-    // edge in the sensitivity list of a block that writes a memory
-    // makes Yosys replace the whole array with individual registers
-    // ("Replacing memory \registers with list of registers").  The
-    // reset branch never touched the array, so folding `!reset` into
-    // the write enable of a plain sync block is behaviour-preserving.
-    always @(posedge clk) begin
-        if (!reset && reg_write && rd_addr != 5'd0) begin
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            // registers do not need explicit reset (synthesis will infer this)
+        end else if (reg_write && rd_addr != 5'd0) begin
             registers[rd_addr] <= write_data_back;
         end
     end
@@ -1483,19 +1478,9 @@ module Memory_And_MMIO (
             gpio_out <= 32'd0;
             gpio_dir <= 32'd0;
         end else begin
-            if (mem_write && hit_gpio_out)  gpio_out <= write_data;
-            if (mem_write && hit_gpio_dir)  gpio_dir <= write_data;
-        end
-    end
-
-    // BITF memfix (v4.12.1 companion): the data_ram write moved out of
-    // the async-reset block above so Yosys can keep \data_ram as ONE
-    // real memory ($mem) instead of exploding it into registers.  The
-    // `!reset` guard reproduces the original behaviour exactly (the
-    // old block never wrote the RAM while its reset branch was taken).
-    always @(posedge clk) begin
-        if (!reset && mem_write && !is_mmio) begin
-            data_ram[ram_addr] <= write_data;
+            if (mem_write && !is_mmio)      data_ram[ram_addr] <= write_data;
+            if (mem_write && hit_gpio_out)  gpio_out           <= write_data;
+            if (mem_write && hit_gpio_dir)  gpio_dir           <= write_data;
         end
     end
 

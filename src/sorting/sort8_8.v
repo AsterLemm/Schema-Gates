@@ -6,6 +6,12 @@
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
 
+// --- sort8_8_cmpex : compare-exchange cell (lo = min, hi = max) ---
+module sort8_8_cmpex(input [7:0] x, input [7:0] y, output [7:0] lo, output [7:0] hi);
+    assign lo = (x < y) ? x : y;
+    assign hi = (x < y) ? y : x;
+endmodule
+
 module sort8_8(input [7:0] in0, input [7:0] in1, input [7:0] in2, input [7:0] in3, input [7:0] in4, input [7:0] in5, input [7:0] in6, input [7:0] in7, output [7:0] out0, output [7:0] out1, output [7:0] out2, output [7:0] out3, output [7:0] out4, output [7:0] out5, output [7:0] out6, output [7:0] out7);
     // define out0 output 120.255.160
     wire [7:0] w0, w1;
@@ -27,44 +33,25 @@ module sort8_8(input [7:0] in0, input [7:0] in1, input [7:0] in2, input [7:0] in
     wire [7:0] w32, w33;
     wire [7:0] w34, w35;
     wire [7:0] w36, w37;
-    assign w0 = (in0 < in1) ? in0 : in1;
-    assign w1 = (in0 < in1) ? in1 : in0;
-    assign w2 = (in2 < in3) ? in2 : in3;
-    assign w3 = (in2 < in3) ? in3 : in2;
-    assign w4 = (in4 < in5) ? in4 : in5;
-    assign w5 = (in4 < in5) ? in5 : in4;
-    assign w6 = (in6 < in7) ? in6 : in7;
-    assign w7 = (in6 < in7) ? in7 : in6;
-    assign w8 = (w0 < w2) ? w0 : w2;
-    assign w9 = (w0 < w2) ? w2 : w0;
-    assign w10 = (w1 < w3) ? w1 : w3;
-    assign w11 = (w1 < w3) ? w3 : w1;
-    assign w12 = (w4 < w6) ? w4 : w6;
-    assign w13 = (w4 < w6) ? w6 : w4;
-    assign w14 = (w5 < w7) ? w5 : w7;
-    assign w15 = (w5 < w7) ? w7 : w5;
-    assign w16 = (w10 < w9) ? w10 : w9;
-    assign w17 = (w10 < w9) ? w9 : w10;
-    assign w18 = (w14 < w13) ? w14 : w13;
-    assign w19 = (w14 < w13) ? w13 : w14;
-    assign w20 = (w8 < w12) ? w8 : w12;
-    assign w21 = (w8 < w12) ? w12 : w8;
-    assign w22 = (w11 < w15) ? w11 : w15;
-    assign w23 = (w11 < w15) ? w15 : w11;
-    assign w24 = (w16 < w18) ? w16 : w18;
-    assign w25 = (w16 < w18) ? w18 : w16;
-    assign w26 = (w17 < w19) ? w17 : w19;
-    assign w27 = (w17 < w19) ? w19 : w17;
-    assign w28 = (w24 < w21) ? w24 : w21;
-    assign w29 = (w24 < w21) ? w21 : w24;
-    assign w30 = (w22 < w27) ? w22 : w27;
-    assign w31 = (w22 < w27) ? w27 : w22;
-    assign w32 = (w26 < w29) ? w26 : w29;
-    assign w33 = (w26 < w29) ? w29 : w26;
-    assign w34 = (w30 < w25) ? w30 : w25;
-    assign w35 = (w30 < w25) ? w25 : w30;
-    assign w36 = (w34 < w33) ? w34 : w33;
-    assign w37 = (w34 < w33) ? w33 : w34;
+    sort8_8_cmpex u_ce0(.x(in0), .y(in1), .lo(w0), .hi(w1));
+    sort8_8_cmpex u_ce1(.x(in2), .y(in3), .lo(w2), .hi(w3));
+    sort8_8_cmpex u_ce2(.x(in4), .y(in5), .lo(w4), .hi(w5));
+    sort8_8_cmpex u_ce3(.x(in6), .y(in7), .lo(w6), .hi(w7));
+    sort8_8_cmpex u_ce4(.x(w0), .y(w2), .lo(w8), .hi(w9));
+    sort8_8_cmpex u_ce5(.x(w1), .y(w3), .lo(w10), .hi(w11));
+    sort8_8_cmpex u_ce6(.x(w4), .y(w6), .lo(w12), .hi(w13));
+    sort8_8_cmpex u_ce7(.x(w5), .y(w7), .lo(w14), .hi(w15));
+    sort8_8_cmpex u_ce8(.x(w10), .y(w9), .lo(w16), .hi(w17));
+    sort8_8_cmpex u_ce9(.x(w14), .y(w13), .lo(w18), .hi(w19));
+    sort8_8_cmpex u_ce10(.x(w8), .y(w12), .lo(w20), .hi(w21));
+    sort8_8_cmpex u_ce11(.x(w11), .y(w15), .lo(w22), .hi(w23));
+    sort8_8_cmpex u_ce12(.x(w16), .y(w18), .lo(w24), .hi(w25));
+    sort8_8_cmpex u_ce13(.x(w17), .y(w19), .lo(w26), .hi(w27));
+    sort8_8_cmpex u_ce14(.x(w24), .y(w21), .lo(w28), .hi(w29));
+    sort8_8_cmpex u_ce15(.x(w22), .y(w27), .lo(w30), .hi(w31));
+    sort8_8_cmpex u_ce16(.x(w26), .y(w29), .lo(w32), .hi(w33));
+    sort8_8_cmpex u_ce17(.x(w30), .y(w25), .lo(w34), .hi(w35));
+    sort8_8_cmpex u_ce18(.x(w34), .y(w33), .lo(w36), .hi(w37));
     assign out0 = w20;
     assign out1 = w28;
     assign out2 = w32;

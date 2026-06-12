@@ -49,55 +49,125 @@
 //  S=0 guest data op still refreshes them (sequence S-dependent code
 //  accordingly); MOVS gets Z/N via an OR AX,AX fix-up which clears CF.
 //
+//  MODULAR: guest-field decode + the translate cloud are drillable.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
 
-module interp_arm_to_x86_16(
-    // host fetch side: connect to cpu_x86_16 imem_addr / imem_data
-    input  wire [7:0]  host_addr,
-    output reg  [15:0] host_instr,
-    // guest program side: connect to the guest binary ROM (32 x 32-bit)
-    output wire [4:0]  guest_addr,
+// --- interp_arm_to_x86_16_gdec : guest field extraction + class decode ---
+// (verbatim from the monolithic body; wire = -> assign =)
+module interp_arm_to_x86_16_gdec(
     input  wire [31:0] guest_instr,
-    // high while feeding HLT for an untranslatable guest instruction
+    output wire [3:0] cond,
+    output wire sbit,
+    output wire [1:0] cls,
+    output wire [3:0] op4,
+    output wire [3:0] rd,
+    output wire [3:0] rn,
+    output wire [3:0] rm,
+    output wire [1:0] shtyp,
+    output wire [4:0] shamt,
+    output wire [7:0] imm8,
+    output wire [16:0] imm17,
+    output wire is_dp,
+    output wire is_imm,
+    output wire is_mem,
+    output wire is_flow,
+    output wire is_test,
+    output wire is_mov,
+    output wire is_mvn,
+    output wire is_bic,
+    output wire is_rsb,
+    output wire bad_sh,
+    output wire bad_op
+);
+    // ---- guest field extraction (cpu_arm16 encoding) -------------------
+    assign cond = guest_instr[31:28];
+    assign sbit = guest_instr[27];
+    assign cls = guest_instr[26:25];
+    assign op4 = guest_instr[24:21];
+    assign rd = guest_instr[20:17];
+    assign rn = guest_instr[16:13];
+    assign rm = guest_instr[12:9];
+    assign shtyp = guest_instr[8:7];
+    assign shamt = guest_instr[6:2];
+    assign imm8 = guest_instr[12:5];
+    assign imm17 = guest_instr[16:0];
+
+    assign is_dp = (cls[1] == 1'b0);
+    assign is_imm = (cls == 2'b01);
+    assign is_mem = (cls == 2'b10);
+    assign is_flow = (cls == 2'b11);
+    assign is_test = is_dp && (op4 >= 4'd12);          // CMP CMN TST TEQ
+    assign is_mov = is_dp && ((op4 == 4'd8) || (op4 == 4'd11));
+    assign is_mvn = is_dp && (op4 == 4'd9);
+    assign is_bic = is_dp && (op4 == 4'd10);
+    assign is_rsb = is_dp && (op4 == 4'd3);
+    assign bad_sh = is_dp && (cls == 2'b00) && ((shtyp != 2'd0) || (shamt != 5'd0));
+    assign bad_op = is_dp && ((op4 == 4'd5) || (op4 == 4'd6)); // ADC SBC
+
+endmodule
+
+// --- interp_arm_to_x86_16_xlat : the bundle translator (guest -> host words) ---
+// the entire translate cloud of the old monolithic body, carried
+// over verbatim; guest fields come from interp_arm_to_x86_16_gdec inside.
+module interp_arm_to_x86_16_xlat(
+    input  wire [7:0]  host_addr,
+    input  wire [4:0]  gpc,
+    input  wire [2:0]  slot,
+    input  wire [31:0] guest_instr,
+    output reg  [15:0] host_instr,
     output reg         trap
 );
-    // define host_addr    input  255.190.70
-    // define host_instr   output 120.200.255
-    // define guest_addr   output 255.140.60
-    // define guest_instr  input  68.68.242
-    // define trap         output 255.80.80
+    wire [3:0] cond;
+    wire sbit;
+    wire [1:0] cls;
+    wire [3:0] op4;
+    wire [3:0] rd;
+    wire [3:0] rn;
+    wire [3:0] rm;
+    wire [1:0] shtyp;
+    wire [4:0] shamt;
+    wire [7:0] imm8;
+    wire [16:0] imm17;
+    wire is_dp;
+    wire is_imm;
+    wire is_mem;
+    wire is_flow;
+    wire is_test;
+    wire is_mov;
+    wire is_mvn;
+    wire is_bic;
+    wire is_rsb;
+    wire bad_sh;
+    wire bad_op;
 
-    wire [4:0] gpc  = host_addr[7:3];
-    wire [2:0] slot = host_addr[2:0];
-    assign guest_addr = gpc;
-
-    // ---- guest field extraction (cpu_arm16 encoding) -------------------
-    wire [3:0]  cond  = guest_instr[31:28];
-    wire        sbit  = guest_instr[27];
-    wire [1:0]  cls   = guest_instr[26:25];
-    wire [3:0]  op4   = guest_instr[24:21];
-    wire [3:0]  rd    = guest_instr[20:17];
-    wire [3:0]  rn    = guest_instr[16:13];
-    wire [3:0]  rm    = guest_instr[12:9];
-    wire [1:0]  shtyp = guest_instr[8:7];
-    wire [4:0]  shamt = guest_instr[6:2];
-    wire [7:0]  imm8  = guest_instr[12:5];
-    wire [16:0] imm17 = guest_instr[16:0];
-
-    wire is_dp   = (cls[1] == 1'b0);
-    wire is_imm  = (cls == 2'b01);
-    wire is_mem  = (cls == 2'b10);
-    wire is_flow = (cls == 2'b11);
-    wire is_test = is_dp && (op4 >= 4'd12);          // CMP CMN TST TEQ
-    wire is_mov  = is_dp && ((op4 == 4'd8) || (op4 == 4'd11));
-    wire is_mvn  = is_dp && (op4 == 4'd9);
-    wire is_bic  = is_dp && (op4 == 4'd10);
-    wire is_rsb  = is_dp && (op4 == 4'd3);
-    wire bad_sh  = is_dp && (cls == 2'b00) && ((shtyp != 2'd0) || (shamt != 5'd0));
-    wire bad_op  = is_dp && ((op4 == 4'd5) || (op4 == 4'd6)); // ADC SBC
+    interp_arm_to_x86_16_gdec u_gdec(
+        .guest_instr(guest_instr),
+        .cond(cond),
+        .sbit(sbit),
+        .cls(cls),
+        .op4(op4),
+        .rd(rd),
+        .rn(rn),
+        .rm(rm),
+        .shtyp(shtyp),
+        .shamt(shamt),
+        .imm8(imm8),
+        .imm17(imm17),
+        .is_dp(is_dp),
+        .is_imm(is_imm),
+        .is_mem(is_mem),
+        .is_flow(is_flow),
+        .is_test(is_test),
+        .is_mov(is_mov),
+        .is_mvn(is_mvn),
+        .is_bic(is_bic),
+        .is_rsb(is_rsb),
+        .bad_sh(bad_sh),
+        .bad_op(bad_op)
+    );
 
     // ---- bundle landmarks ----------------------------------------------
     wire [7:0] b_end  = {gpc, 3'd7};                 // guard skip target
@@ -223,4 +293,30 @@ module interp_arm_to_x86_16(
     end
 endmodule
 
+module interp_arm_to_x86_16(
+    // host fetch side: connect to cpu_x86_16 imem_addr / imem_data
+    input  wire [7:0]  host_addr,
+    output wire [15:0] host_instr,
+    // guest program side: connect to the guest binary ROM (32 x 32-bit)
+    output wire [4:0]  guest_addr,
+    input  wire [31:0] guest_instr,
+    // high while feeding HLT for an untranslatable guest instruction
+    output wire        trap
+);
+    // define host_addr    input  255.190.70
+    // define host_instr   output 120.200.255
+    // define guest_addr   output 255.140.60
+    // define guest_instr  input  68.68.242
+    // define trap         output 255.80.80
 
+    wire [4:0] gpc  = host_addr[7:3];
+    wire [2:0] slot = host_addr[2:0];
+    assign guest_addr = gpc;
+
+    // the entire translator lives in interp_arm_to_x86_16_xlat above
+    interp_arm_to_x86_16_xlat u_xlat(
+        .host_addr(host_addr), .gpc(gpc), .slot(slot),
+        .guest_instr(guest_instr),
+        .host_instr(host_instr), .trap(trap)
+    );
+endmodule

@@ -6,6 +6,18 @@
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
 
+// --- bitonic_sort4_8_cmpasc : ascending compare-exchange (o1 = min, o2 = max) ---
+module bitonic_sort4_8_cmpasc(input [7:0] x, input [7:0] y, output [7:0] o1, output [7:0] o2);
+    assign o1 = (x < y) ? x : y;
+    assign o2 = (x < y) ? y : x;
+endmodule
+
+// --- bitonic_sort4_8_cmpdesc : descending compare-exchange (o1 = max, o2 = min) ---
+module bitonic_sort4_8_cmpdesc(input [7:0] x, input [7:0] y, output [7:0] o1, output [7:0] o2);
+    assign o1 = (x > y) ? x : y;
+    assign o2 = (x > y) ? y : x;
+endmodule
+
 module bitonic_sort4_8(input [7:0] in0, input [7:0] in1, input [7:0] in2, input [7:0] in3, output [7:0] out0, output [7:0] out1, output [7:0] out2, output [7:0] out3);
     // define out0 output 120.255.160
     wire [7:0] b0, b1;
@@ -14,18 +26,12 @@ module bitonic_sort4_8(input [7:0] in0, input [7:0] in1, input [7:0] in2, input 
     wire [7:0] b6, b7;
     wire [7:0] b8, b9;
     wire [7:0] b10, b11;
-    assign b0 = (in0 < in1) ? in0 : in1;
-    assign b1 = (in0 < in1) ? in1 : in0;
-    assign b2 = (in2 > in3) ? in2 : in3;
-    assign b3 = (in2 > in3) ? in3 : in2;
-    assign b4 = (b0 < b2) ? b0 : b2;
-    assign b5 = (b0 < b2) ? b2 : b0;
-    assign b6 = (b1 < b3) ? b1 : b3;
-    assign b7 = (b1 < b3) ? b3 : b1;
-    assign b8 = (b4 < b6) ? b4 : b6;
-    assign b9 = (b4 < b6) ? b6 : b4;
-    assign b10 = (b5 < b7) ? b5 : b7;
-    assign b11 = (b5 < b7) ? b7 : b5;
+    bitonic_sort4_8_cmpasc u_c0(.x(in0), .y(in1), .o1(b0), .o2(b1));
+    bitonic_sort4_8_cmpdesc u_c1(.x(in2), .y(in3), .o1(b2), .o2(b3));
+    bitonic_sort4_8_cmpasc u_c2(.x(b0), .y(b2), .o1(b4), .o2(b5));
+    bitonic_sort4_8_cmpasc u_c3(.x(b1), .y(b3), .o1(b6), .o2(b7));
+    bitonic_sort4_8_cmpasc u_c4(.x(b4), .y(b6), .o1(b8), .o2(b9));
+    bitonic_sort4_8_cmpasc u_c5(.x(b5), .y(b7), .o1(b10), .o2(b11));
     assign out0 = b8;
     assign out1 = b9;
     assign out2 = b10;

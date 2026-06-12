@@ -5,10 +5,66 @@
 //  beam scanout, painter priority (higher slot on top), double-
 //  buffered scene. Same bus + CONTROL bit map as the flagship GPU.v;
 //  RGB12 is nibble-expanded onto px_rgb[23:0] exactly like GPU.v.
+//  MODULAR: 8 coverage leaf units + a painter colour mux unit.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
+
+// --- gpu_vector32_cov : one slot's coverage test (point/hline/vline/rect) ---
+// covered =
+//   point: x==x0 && y==y0
+//   hline: y==y0 && x0<=x<=x1
+//   vline: x==x0 && y0<=y<=y1
+//   rect : x0<=x<=x1 && y0<=y<=y1
+// operand isolation on the scan coordinates: parked slots hold zeros.
+module gpu_vector32_cov(
+    input  wire [4:0] sx,
+    input  wire [4:0] sy,
+    input  wire       en,
+    input  wire [1:0] ty,
+    input  wire [4:0] x0,
+    input  wire [4:0] y0,
+    input  wire [4:0] x1,
+    input  wire [4:0] y1,
+    output wire       cov
+);
+    wire [4:0] gx = sx & {5{en}};
+    wire [4:0] gy = sy & {5{en}};
+    wire xe = (gx == x0);
+    wire ye = (gy == y0);
+    wire xr = (gx >= x0) & (gx <= x1);
+    wire yr = (gy >= y0) & (gy <= y1);
+    assign cov = en & (
+          (ty == 2'd0) ? (xe & ye)
+        : (ty == 2'd1) ? (ye & xr)
+        : (ty == 2'd2) ? (xe & yr)
+        :                (xr & yr));
+endmodule
+
+// --- gpu_vector32_colmux : painter priority + fill + RGB12->RGB24 expand ---
+module gpu_vector32_colmux(
+    input  wire [7:0]  cov,
+    input  wire [11:0] col0, input wire [11:0] col1,
+    input  wire [11:0] col2, input wire [11:0] col3,
+    input  wire [11:0] col4, input wire [11:0] col5,
+    input  wire [11:0] col6, input wire [11:0] col7,
+    input  wire        ctl_fill,
+    input  wire [11:0] fill_col,
+    output wire [23:0] pix_rgb_w
+);
+    // painter priority: highest covering slot wins
+    wire [11:0] scene_col =
+          cov[7] ? col7 : cov[6] ? col6
+        : cov[5] ? col5 : cov[4] ? col4
+        : cov[3] ? col3 : cov[2] ? col2
+        : cov[1] ? col1 : cov[0] ? col0 : 12'd0;
+    wire [11:0] pix12 = ctl_fill ? fill_col : scene_col;
+    // RGB12 -> RGB24 nibble expansion (flagship convention)
+    assign pix_rgb_w = {pix12[11:8], pix12[11:8],
+                        pix12[7:4],  pix12[7:4],
+                        pix12[3:0],  pix12[3:0]};
+endmodule
 
 //  gpu_vector32: 8 slots x {point | hline | vline | rect} on 32x32, RGB12.
 //
@@ -84,40 +140,42 @@ module gpu_vector32 (
 
     reg [4:0] sx, sy;          // scan position
 
-    // ---- per-slot coverage (generate-style, written out per slot) ----------
-    // covered(s) =
-    //   point: x==x0 && y==y0
-    //   hline: y==y0 && x0<=x<=x1
-    //   vline: x==x0 && y0<=y<=y1
-    //   rect : x0<=x<=x1 && y0<=y<=y1
+    // ---- per-slot coverage (one gpu_vector32_cov leaf per slot) ------------------
     wire [7:0] cov;
-    genvar g;
-    generate for (g = 0; g < 8; g = g + 1) begin : COV
-        // operand isolation on the scan coordinates
-        wire [4:0] gx = sx & {5{a_en[g]}};
-        wire [4:0] gy = sy & {5{a_en[g]}};
-        wire xe = (gx == a_x0[g]);
-        wire ye = (gy == a_y0[g]);
-        wire xr = (gx >= a_x0[g]) & (gx <= a_x1[g]);
-        wire yr = (gy >= a_y0[g]) & (gy <= a_y1[g]);
-        assign cov[g] = a_en[g] & (
-              (a_ty[g] == 2'd0) ? (xe & ye)
-            : (a_ty[g] == 2'd1) ? (ye & xr)
-            : (a_ty[g] == 2'd2) ? (xe & yr)
-            :                     (xr & yr));
-    end endgenerate
+    gpu_vector32_cov u_cov0(.sx(sx), .sy(sy), .en(a_en[0]), .ty(a_ty[0]),
+                       .x0(a_x0[0]), .y0(a_y0[0]),
+                       .x1(a_x1[0]), .y1(a_y1[0]), .cov(cov[0]));
+    gpu_vector32_cov u_cov1(.sx(sx), .sy(sy), .en(a_en[1]), .ty(a_ty[1]),
+                       .x0(a_x0[1]), .y0(a_y0[1]),
+                       .x1(a_x1[1]), .y1(a_y1[1]), .cov(cov[1]));
+    gpu_vector32_cov u_cov2(.sx(sx), .sy(sy), .en(a_en[2]), .ty(a_ty[2]),
+                       .x0(a_x0[2]), .y0(a_y0[2]),
+                       .x1(a_x1[2]), .y1(a_y1[2]), .cov(cov[2]));
+    gpu_vector32_cov u_cov3(.sx(sx), .sy(sy), .en(a_en[3]), .ty(a_ty[3]),
+                       .x0(a_x0[3]), .y0(a_y0[3]),
+                       .x1(a_x1[3]), .y1(a_y1[3]), .cov(cov[3]));
+    gpu_vector32_cov u_cov4(.sx(sx), .sy(sy), .en(a_en[4]), .ty(a_ty[4]),
+                       .x0(a_x0[4]), .y0(a_y0[4]),
+                       .x1(a_x1[4]), .y1(a_y1[4]), .cov(cov[4]));
+    gpu_vector32_cov u_cov5(.sx(sx), .sy(sy), .en(a_en[5]), .ty(a_ty[5]),
+                       .x0(a_x0[5]), .y0(a_y0[5]),
+                       .x1(a_x1[5]), .y1(a_y1[5]), .cov(cov[5]));
+    gpu_vector32_cov u_cov6(.sx(sx), .sy(sy), .en(a_en[6]), .ty(a_ty[6]),
+                       .x0(a_x0[6]), .y0(a_y0[6]),
+                       .x1(a_x1[6]), .y1(a_y1[6]), .cov(cov[6]));
+    gpu_vector32_cov u_cov7(.sx(sx), .sy(sy), .en(a_en[7]), .ty(a_ty[7]),
+                       .x0(a_x0[7]), .y0(a_y0[7]),
+                       .x1(a_x1[7]), .y1(a_y1[7]), .cov(cov[7]));
 
-    // painter priority: highest covering slot wins
-    wire [11:0] scene_col =
-          cov[7] ? a_col[7] : cov[6] ? a_col[6]
-        : cov[5] ? a_col[5] : cov[4] ? a_col[4]
-        : cov[3] ? a_col[3] : cov[2] ? a_col[2]
-        : cov[1] ? a_col[1] : cov[0] ? a_col[0] : 12'd0;
-    wire [11:0] pix12 = ctl_fill ? fill_col : scene_col;
-    // RGB12 -> RGB24 nibble expansion (flagship convention)
-    wire [23:0] pix_rgb_w = {pix12[11:8], pix12[11:8],
-                             pix12[7:4],  pix12[7:4],
-                             pix12[3:0],  pix12[3:0]};
+    // painter priority + fill + nibble expansion (see gpu_vector32_colmux above)
+    wire [23:0] pix_rgb_w;
+    gpu_vector32_colmux u_colmux(
+        .cov(cov),
+        .col0(a_col[0]), .col1(a_col[1]), .col2(a_col[2]), .col3(a_col[3]),
+        .col4(a_col[4]), .col5(a_col[5]), .col6(a_col[6]), .col7(a_col[7]),
+        .ctl_fill(ctl_fill), .fill_col(fill_col),
+        .pix_rgb_w(pix_rgb_w)
+    );
 
     // ---- scan FSM -------------------------------------------------------------
     localparam S_IDLE = 2'd0, S_PIX = 2'd1, S_NEXT = 2'd2;

@@ -24,10 +24,38 @@
 //   * frame_start clears the accumulator, frame_done latches it into
 //     frame_sig and pulses sig_valid; frame_index counts latched frames.
 //
+//  MODULAR: the unrolled CRC cascade is a drillable leaf unit.
 //  Part of schema-gates by BITFries.
 //  Self-contained: embeds every submodule it uses, down to leaf gates.
 //  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
 // =====================================================================
+
+// --- gpu_frame_crc32_step : CRC-32 over one 40-bit pixel record ---
+// IEEE polynomial 0x04C11DB7, MSB-first, fully unrolled (the gate mass
+// of this design lives here).
+module gpu_frame_crc32_step(
+    input  wire [31:0] c,
+    input  wire [39:0] d,
+    output wire [31:0] n
+);
+    localparam [31:0] POLY = 32'h04C11DB7;
+
+    function [31:0] crc40;
+        input [31:0] c;
+        input [39:0] d;
+        integer k;
+        reg fb;
+        begin
+            crc40 = c;
+            for (k = 39; k >= 0; k = k - 1) begin
+                fb    = crc40[31] ^ d[k];
+                crc40 = {crc40[30:0], 1'b0} ^ (fb ? POLY : 32'd0);
+            end
+        end
+    endfunction
+
+    assign n = crc40(c, d);
+endmodule
 
 module gpu_frame_crc32(
     input  wire        clk,
@@ -59,24 +87,12 @@ module gpu_frame_crc32(
     // define sig_valid    output 255.255.120
     // define frame_index  output 120.200.255
 
-    localparam [31:0] POLY = 32'h04C11DB7;
-
-    // CRC-32 over one 40-bit pixel record, MSB-first, fully unrolled
-    function [31:0] crc40;
-        input [31:0] c;
-        input [39:0] d;
-        integer k;
-        reg fb;
-        begin
-            crc40 = c;
-            for (k = 39; k >= 0; k = k - 1) begin
-                fb    = crc40[31] ^ d[k];
-                crc40 = {crc40[30:0], 1'b0} ^ (fb ? POLY : 32'd0);
-            end
-        end
-    endfunction
-
+    // the unrolled CRC cascade lives in gpu_frame_crc32_step above
     reg [31:0] acc;
+    wire [31:0] crc_next;
+    gpu_frame_crc32_step u_step(
+        .c(acc), .d({px_x, px_y, px_rgb}), .n(crc_next)
+    );
 
     always @(posedge clk) begin
         if (reset) begin
@@ -89,7 +105,7 @@ module gpu_frame_crc32(
             if (frame_start) begin
                 acc <= 32'hFFFFFFFF;
             end else if (px_valid && accept) begin
-                acc <= crc40(acc, {px_x, px_y, px_rgb});
+                acc <= crc_next;
             end
             if (frame_done) begin
                 frame_sig   <= acc;
