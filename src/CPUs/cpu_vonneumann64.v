@@ -1,0 +1,230 @@
+// =====================================================================
+//  cpu_vonneumann64.v
+//  64-bit VON NEUMANN accumulator CPU (multicycle, unified memory).
+//  One 16x64 memory holds code AND data behind a single port,
+//  so the FSM serializes fetch and execute (the classic bottleneck).
+//  ISA: NOP LDA STA ADD SUB AND OR XOR LDI JMP JZ JC SHL SHR OUT HLT.
+//  Load program via prog_* while run=0, then raise run (PC starts 0).
+//  MODULAR: the unified memory and the operand-isolated ALU (with
+//  arith / logic / shift leaf paths) are drillable submodules; the
+//  fetch/execute FSM stays in the top.
+//  Part of schema-gates by BITFries.
+//  Self-contained: embeds every submodule it uses, down to leaf gates.
+//  Target synthesizer: BITF-Synthesis Engine (Verilog -> SchemaGates).
+// =====================================================================
+
+// --- cpu_vonneumann64_mem : the unified von Neumann memory (16x64) ---
+// ONE muxed write port carries both program loading (run=0) and STA
+// (run=1, EXEC); ONE async read path is time-multiplexed by the FSM.
+module cpu_vonneumann64_mem(
+    input  wire        clk,
+    input  wire        we,
+    input  wire [3:0]  waddr,
+    input  wire [63:0]  wdata,
+    input  wire [3:0]  raddr,
+    output wire [63:0]  rdata
+);
+    reg [63:0] mem [0:15];
+
+    assign rdata = mem[raddr];
+
+    // sync write only (no async edge: keeps the array ONE $mem cell)
+    always @(posedge clk) begin
+        if (we) mem[waddr] <= wdata;
+    end
+endmodule
+
+// --- cpu_vonneumann64_alu_arith : ADD / SUB with carry view (leaf of cpu_vonneumann64_alu) ---
+module cpu_vonneumann64_alu_arith(
+    input  wire [63:0] ar_a,
+    input  wire [63:0] ar_b,
+    input  wire        is_sub,
+    output wire [64:0]   ar_sum
+);
+    assign ar_sum = is_sub ? ({1'b0, ar_a} - {1'b0, ar_b})
+                           : ({1'b0, ar_a} + {1'b0, ar_b});
+endmodule
+
+// --- cpu_vonneumann64_alu_logic : AND / OR / XOR (leaf of cpu_vonneumann64_alu) ---
+module cpu_vonneumann64_alu_logic(
+    input  wire [63:0] lg_a,
+    input  wire [63:0] lg_b,
+    input  wire [3:0]  opcode,
+    output wire [63:0] lg_y
+);
+    assign lg_y = (opcode == 4'h5) ? (lg_a & lg_b)
+                : (opcode == 4'h6) ? (lg_a | lg_b)
+                :                    (lg_a ^ lg_b);
+endmodule
+
+// --- cpu_vonneumann64_alu_shift : SHL / SHR with carry-out (leaf of cpu_vonneumann64_alu) ---
+module cpu_vonneumann64_alu_shift(
+    input  wire [63:0] sh_a,
+    input  wire [3:0]  opcode,
+    output wire [63:0] sh_y,
+    output wire        sh_c
+);
+    assign sh_y = (opcode == 4'hC) ? {sh_a[62:0], 1'b0}
+                :                    {1'b0, sh_a[63:1]};
+    assign sh_c = (opcode == 4'hC) ? sh_a[63] : sh_a[0];
+endmodule
+
+// --- cpu_vonneumann64_alu : operand-isolated accumulator ALU (flagship technique) ---
+// Each path's inputs are ANDed with its select so unused paths hold 0.
+module cpu_vonneumann64_alu(
+    input  wire [63:0] acc,
+    input  wire [63:0] mem_rdata,
+    input  wire [3:0]  opcode,
+    output wire [64:0]   ar_sum,
+    output wire [63:0] lg_y,
+    output wire [63:0] sh_y,
+    output wire        sh_c
+);
+    wire is_add = (opcode == 4'h3);
+    wire is_sub = (opcode == 4'h4);
+    wire sel_arith = is_add | is_sub;
+    wire sel_logic = (opcode == 4'h5) | (opcode == 4'h6) | (opcode == 4'h7);
+    wire sel_shift = (opcode == 4'hC) | (opcode == 4'hD);
+
+    wire [63:0] ar_a = acc       & {64{sel_arith}};
+    wire [63:0] ar_b = mem_rdata & {64{sel_arith}};
+    cpu_vonneumann64_alu_arith u_arith(.ar_a(ar_a), .ar_b(ar_b), .is_sub(is_sub),
+                          .ar_sum(ar_sum));
+
+    wire [63:0] lg_a = acc       & {64{sel_logic}};
+    wire [63:0] lg_b = mem_rdata & {64{sel_logic}};
+    cpu_vonneumann64_alu_logic u_logic(.lg_a(lg_a), .lg_b(lg_b), .opcode(opcode),
+                          .lg_y(lg_y));
+
+    wire [63:0] sh_a = acc & {64{sel_shift}};
+    cpu_vonneumann64_alu_shift u_shift(.sh_a(sh_a), .opcode(opcode),
+                          .sh_y(sh_y), .sh_c(sh_c));
+endmodule
+
+module cpu_vonneumann64(
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        run,
+    // unified-memory load port (active while run=0)
+    input  wire        prog_we,
+    input  wire [3:0]  prog_addr,
+    input  wire [63:0]  prog_data,
+    // OUT instruction port
+    output reg  [63:0]  out_data,
+    output reg         out_valid,
+    // status / debug
+    output wire        halted,
+    output wire [63:0]  dbg_acc,
+    output wire [3:0]  dbg_pc
+);
+    // define clk                    input   255.230.80
+    // define rst                    input   255.80.80
+    // define run                    input   255.180.80
+    // define prog_we                input   200.120.255
+    // define prog_addr              input   160.120.255
+    // define prog_data              input   120.120.255
+    // define out_data               output  120.255.160
+    // define out_valid              output  97.255.239
+    // define halted                 output  255.120.120
+    // define dbg_acc                output  178.54.0
+    // define dbg_pc                 output  255.0.26
+
+    localparam ST_FETCH  = 2'd0;
+    localparam ST_EXEC   = 2'd1;
+    localparam ST_HALT   = 2'd2;
+    reg [1:0] state;
+
+    reg [3:0] pc;
+    reg [63:0] acc;
+    reg [3:0] opcode;
+    reg carry;
+
+    wire zero = (acc == {64{1'b0}});
+
+    // single memory read path, time-multiplexed by the FSM:
+    //   ST_FETCH/ST_FETCH2 -> mem[pc] (instruction stream)
+    //   ST_EXEC            -> mem[operand] (data, for LDA/ADD/...)
+    // operand is registered with the opcode at the end of ST_FETCH
+    reg  [3:0] operand;
+    wire [3:0] cur_opcode  = opcode;
+    wire [3:0] cur_operand = operand;
+    wire [3:0] mem_raddr = (state == ST_EXEC) ? cur_operand : pc;
+
+    // ------------------------------------------------------------------
+    // UNIFIED MEMORY -- the von Neumann signature. Code and data share
+    // this single array and its single read path; the FSM below decides
+    // whether the current access is an instruction fetch or a data access.
+    // ONE muxed write port: program-load (run=0) or STA (run=1, EXEC).
+    // Identical conditions to the old monolithic always block.
+    // ------------------------------------------------------------------
+    wire mem_we = (~rst & ~run & prog_we)
+                | (~rst & run & (state == ST_EXEC) & (cur_opcode == 4'h2));
+    wire [3:0] mem_waddr = (~run) ? prog_addr : mem_raddr;
+    wire [63:0] mem_wdata = (~run) ? prog_data : acc;
+    wire [63:0] mem_rdata;
+    cpu_vonneumann64_mem u_mem(
+        .clk(clk),
+        .we(mem_we), .waddr(mem_waddr), .wdata(mem_wdata),
+        .raddr(mem_raddr), .rdata(mem_rdata)
+    );
+
+    // ---- ALU (operand-isolated paths inside) -------------------------
+    wire [64:0]   ar_sum;
+    wire [63:0] lg_y, sh_y;
+    wire sh_c;
+    cpu_vonneumann64_alu u_alu(
+        .acc(acc), .mem_rdata(mem_rdata), .opcode(cur_opcode),
+        .ar_sum(ar_sum), .lg_y(lg_y), .sh_y(sh_y), .sh_c(sh_c)
+    );
+
+    assign halted  = (state == ST_HALT);
+    assign dbg_acc = acc;
+    assign dbg_pc  = pc;
+
+    // sequencing: identical to the monolithic core; the unified-memory
+    // writes (program load + STA) moved into u_mem, same conditions.
+    always @(posedge clk) begin
+        out_valid <= 1'b0;
+        if (rst) begin
+            state <= ST_FETCH; pc <= 4'd0; acc <= {64{1'b0}};
+            carry <= 1'b0; opcode <= 4'h0;
+            operand <= 4'h0;
+            out_data <= {64{1'b0}};
+        end else if (!run) begin
+            // program-load mode (the write itself lives in u_mem)
+            state <= ST_FETCH; pc <= 4'd0;
+        end else begin
+            case (state)
+                ST_FETCH: begin
+                    opcode  <= mem_rdata[63:60];
+                    operand <= mem_rdata[3:0];
+                    pc      <= pc + 4'd1;
+                    state   <= ST_EXEC;
+                end
+                ST_EXEC: begin
+                    state <= ST_FETCH;
+                    case (cur_opcode)
+                        4'h0: ;                                   // NOP
+                        4'h1: acc <= mem_rdata;                   // LDA
+                        4'h2: ;       // STA (the write lives in u_mem)
+                        4'h3: begin acc <= ar_sum[63:0]; carry <= ar_sum[64]; end // ADD
+                        4'h4: begin acc <= ar_sum[63:0]; carry <= ar_sum[64]; end // SUB (carry = borrow)
+                        4'h5, 4'h6, 4'h7: acc <= lg_y;            // AND OR XOR
+                        4'h8: acc <= {{60{1'b0}}, cur_operand}; // LDI
+                        4'h9: pc <= cur_operand;                       // JMP
+                        4'hA: if (zero)  pc <= cur_operand;            // JZ
+                        4'hB: if (carry) pc <= cur_operand;            // JC
+                        4'hC, 4'hD: begin acc <= sh_y; carry <= sh_c; end // SHL SHR
+                        4'hE: begin out_data <= acc; out_valid <= 1'b1; end // OUT
+                        4'hF: state <= ST_HALT;                   // HLT
+                        default: ;
+                    endcase
+                end
+                ST_HALT: state <= ST_HALT;
+                default: state <= ST_FETCH;
+            endcase
+        end
+    end
+endmodule
+
+
